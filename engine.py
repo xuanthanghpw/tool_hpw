@@ -355,6 +355,44 @@ ZERO_CHECK_FIELDS = ["insurance", "ioss", "import_taxes", "peak_season",
                       "vat_eu", "eu_extra"]
 
 
+def _try_parse_number(v):
+    """Best-effort, SAFE conversion of a raw cell value to a float, used to
+    decide whether a ZERO_CHECK_FIELDS column is genuinely all-zero.
+
+    Returns (ok, number):
+    - ok=True  -> `v` was confidently read as a number (or was truly empty,
+                  which counts as 0).
+    - ok=False -> `v` is some value we could NOT confidently parse as a
+                  number (e.g. free text, a formula string, an odd type).
+                  In that case the caller must NOT assume it is 0 -- it
+                  might be hiding real, non-zero data.
+
+    This replaces the old check, which only summed values that were
+    already a Python int/float and silently treated everything else
+    (numeric text like "12.5", stray strings, etc.) as if it were 0 --
+    that could make a column with real non-zero data look "all zero" and
+    get it wrongly dropped from the output.
+    """
+    if v is None:
+        return True, 0.0
+    if isinstance(v, bool):
+        # guard: bool is technically an int subclass in Python, but a
+        # True/False flag here is not a monetary amount -- treat it as
+        # unparsable rather than silently reading it as 1.0/0.0.
+        return False, 0.0
+    if isinstance(v, (int, float)):
+        return True, float(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return True, 0.0
+        try:
+            return True, float(s.replace(",", ""))
+        except ValueError:
+            return False, 0.0
+    return False, 0.0
+
+
 # ===========================================================================
 # 2. robust readers
 # ===========================================================================
@@ -614,7 +652,8 @@ FLIGHT_TITLE_RE = re.compile(
 
 
 def build_debit_editted(debit_path, ct_path, output_path, ci_code="",
-                         progress=None, flight_title=None, ec_code=None):
+                         progress=None, flight_title=None, ec_code=None,
+                         confirm_callback=None):
     """Main entry point. progress: optional callable(str) for status updates.
 
     flight_title: optional. If given, this EXACT string is used as the
@@ -629,6 +668,24 @@ def build_debit_editted(debit_path, ct_path, output_path, ci_code="",
     written into the Summary/All header cell instead of the value being
     auto-computed from month/period. When not given, behavior is unchanged
     (auto-computed as before).
+
+    confirm_callback: optional. Used ONLY when one or more of
+    ZERO_CHECK_FIELDS looks risky to auto-drop (see the "zero-total
+    columns" step below) -- i.e. its total isn't confidently zero, or it
+    holds values that couldn't be safely read as numbers. When that
+    happens, this tool must ask the user before proceeding, instead of
+    silently guessing:
+        confirm_callback(risky_fields: list[str]) -> bool
+    The GUI/caller is expected to show a Yes/No dialog listing
+    `risky_fields` and return True for "Co" (yes) or False/None for
+    "Khong" (no) / no selection made.
+    - True  ("Co")   -> this run stops WITHOUT creating the output file
+                        (logged as "bao cao chua duoc tao"); since this
+                        tool is normally invoked repeatedly, that is a
+                        clean early return, not a crash.
+    - False/None, or no confirm_callback supplied at all -> processing
+      stops entirely by raising RuntimeError, so a bad file can never be
+      produced silently.
     """
 
     def log(msg):
@@ -759,16 +816,83 @@ def build_debit_editted(debit_path, ct_path, output_path, ci_code="",
         log(f"Ma EC tu dong tao: '{ec_code}'")
 
     # ---- zero-total columns (dropped from All sheet, like the original process) ----
+    # SAFETY: a field is only ever treated as "all zero" (and therefore
+    # safe to drop) when EVERY value in that column can be confidently
+    # read as 0. The old check summed only values that were already a
+    # Python int/float and quietly skipped anything else -- so a column
+    # holding real, non-zero data (e.g. stored as text, or of some other
+    # type) could look "all zero" by accident and get wrongly dropped,
+    # silently corrupting the output. We now:
+    #   1. parse every value robustly (numbers, numeric text, blanks), and
+    #   2. flag -- rather than auto-drop -- any field where we find a
+    #      genuine non-zero number OR a value we could not confidently
+    #      parse (so it might secretly be non-zero).
     drop_zero_fields = set()
+    risky_fields = []  # human-readable descriptions of suspicious fields
     for field in ZERO_CHECK_FIELDS:
-        s = 0.0
+        total = 0.0
+        has_unparsable = False
+        unparsable_examples = []
         for row in all_rows:
             v = row.get(field)
-            if isinstance(v, (int, float)):
-                s += v
-        if abs(s) < 1e-9:
+            ok, num = _try_parse_number(v)
+            if ok:
+                total += num
+            else:
+                has_unparsable = True
+                if len(unparsable_examples) < 3:
+                    unparsable_examples.append(v)
+
+        is_zero_total = abs(total) < 1e-9
+        if is_zero_total and not has_unparsable:
             drop_zero_fields.add(field)
-    log(f"Truong co tong = 0 (da bi bo qua o output): {sorted(drop_zero_fields)}")
+        elif is_zero_total and has_unparsable:
+            risky_fields.append(
+                f"{field} (co gia tri khong doc duoc dang so, vd: {unparsable_examples})"
+            )
+        else:
+            risky_fields.append(f"{field} (tong khac 0: {total:g})")
+
+    log(f"Truong co tong = 0 (an toan de bo qua o output): {sorted(drop_zero_fields)}")
+
+    if risky_fields:
+        warning_msg = (
+            "CANH BAO: cac truong sau trong ZERO_CHECK_FIELDS KHONG chac "
+            "chan bang 0 (hoac co du lieu bat thuong) -- de tranh sai lech "
+            "du lieu, cac truong nay se KHONG bi tu dong bo qua/xoa khoi "
+            "output:\n  - " + "\n  - ".join(risky_fields)
+        )
+        log(warning_msg)
+
+        user_confirmed = None
+        if confirm_callback is not None:
+            try:
+                user_confirmed = confirm_callback(risky_fields)
+            except Exception as exc:
+                log(f"Loi khi hoi xac nhan nguoi dung: {exc}")
+                user_confirmed = None
+        else:
+            log("Khong co confirm_callback duoc truyen vao -> khong the "
+                "hien hop thoai xac nhan, mac dinh dung xu ly de dam bao "
+                "an toan du lieu.")
+
+        if user_confirmed is True:
+            # User chose "Co": do NOT create the output file this run.
+            # Because this tool is normally called repeatedly (long-running
+            # process / GUI loop), returning here simply skips generating
+            # debit_editted.xlsx for this run -- it does not crash the tool.
+            log("Nguoi dung xac nhan 'Co' -> BAO CAO CHUA DUOC TAO. Bo qua "
+                "buoc tao file lan nay, vui long kiem tra lai du lieu dau vao.")
+            return None
+        else:
+            # "Khong", or no selection at all -> stop the tool entirely so
+            # a potentially-wrong file is never produced.
+            log("Nguoi dung chon 'Khong' hoac khong xac nhan -> dung chay tool.")
+            raise RuntimeError(
+                "Dung xu ly: phat hien du lieu bat thuong o cac truong "
+                "ZERO_CHECK_FIELDS (xem canh bao ben tren) va nguoi dung "
+                "khong xac nhan tiep tuc."
+            )
 
     # ================= build 'CODE KHACH + QB' helper sheet =================
     log("Nhung bang khach hang vao workbook (de dung VLOOKUP noi bo)...")
@@ -1049,6 +1173,27 @@ def build_debit_editted(debit_path, ct_path, output_path, ci_code="",
     return output_path
 
 
+def _console_confirm_zero_fields(risky_fields):
+    """Default confirm_callback for command-line runs: shows the warning
+    list in the terminal and asks a real Co/Khong (Yes/No) question.
+    A GUI caller should pass its own confirm_callback that pops up an
+    actual dialog box instead of using this console version.
+    """
+    print("\n" + "=" * 70)
+    print("CANH BAO: cac truong ZERO_CHECK_FIELDS sau co du lieu bat thuong,")
+    print("khong the tu dong bo qua/xoa khoi output:")
+    for f in risky_fields:
+        print(f"  - {f}")
+    print("=" * 70)
+    while True:
+        ans = input("Ban co muon TIEP TUC (bo qua tao file lan nay) khong? "
+                     "[Co/Khong]: ").strip().lower()
+        if ans in ("co", "c", "yes", "y"):
+            return True
+        if ans in ("khong", "k", "no", "n", ""):
+            return False
+
+
 if __name__ == "__main__":
     import sys
     # Cach dung:
@@ -1064,4 +1209,5 @@ if __name__ == "__main__":
         else:
             ci = rest[0]
     build_debit_editted(debit_path, ct_path, output_path, ci_code=ci,
-                         flight_title=title, progress=print)
+                         flight_title=title, progress=print,
+                         confirm_callback=_console_confirm_zero_fields)

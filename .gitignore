@@ -1,0 +1,6 @@
+dist/
+buid/
+__pycache__/
+*.spec
+*.ini
+*.rar

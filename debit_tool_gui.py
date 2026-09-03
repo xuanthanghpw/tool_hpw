@@ -131,6 +131,35 @@ class App(tk.Tk):
         self.log_box.see(tk.END)
         self.update_idletasks()
 
+    def confirm_zero_fields(self, risky_fields):
+        """confirm_callback cho engine.build_debit_editted: duoc goi CHI KHI
+        mot hoac nhieu truong trong ZERO_CHECK_FIELDS khong chac chan bang 0
+        (tong khac 0, hoac co gia tri khong doc duoc dang so) - tuc la neu
+        tu dong xoa cot nay khoi output co the gay sai lech du lieu.
+
+        Hien hop thoai canh bao liet ke cac truong do, cho nguoi dung chon:
+          - "Yes" (Co)   -> tra ve True: engine se BO QUA tao file lan nay
+                            (khong xu ly), nhung tool (cua so GUI) van tiep
+                            tuc chay binh thuong de nguoi dung kiem tra lai
+                            du lieu dau vao va thu lai.
+          - "No" (Khong) -> tra ve False: engine se raise loi va DUNG hoan
+                            toan qua trinh xu ly lan nay, khong tao file.
+        """
+        msg = (
+            "Phat hien cac truong ZERO_CHECK_FIELDS co du lieu KHONG chac "
+            "chan bang 0 (neu tu dong bo qua/xoa co the lam sai lech du lieu):\n\n"
+            + "\n".join(f"- {f}" for f in risky_fields)
+            + "\n\nCac truong nay se KHONG bi tu dong xoa khoi output.\n\n"
+            "Ban co muon TIEP TUC khong?\n"
+            "  - Co (Yes): BO QUA tao file lan nay (chua tao debit_editted), "
+            "vui long kiem tra lai du lieu dau vao (file debit goc/ct.xlsx) "
+            "roi chay lai. Cong cu se KHONG dong, ban co the thu lai ngay.\n"
+            "  - Khong (No): DUNG han qua trinh xu ly lan nay, khong tao file."
+        )
+        return messagebox.askyesno(
+            "Canh bao: du lieu bat thuong o ZERO_CHECK_FIELDS", msg
+        )
+
     def run_clicked(self):
         debit_path = self.debit_var.get().strip()
         ct_path = self.ct_var.get().strip()
@@ -164,17 +193,34 @@ class App(tk.Tk):
 
         def worker():
             try:
-                build_debit_editted(
+                result = build_debit_editted(
                     debit_path, ct_path, out_path,
                     ci_code=ci_code,
                     flight_title=(flight_title or None),
                     ec_code=(ec_code or None),
                     progress=self.log,
+                    confirm_callback=self.confirm_zero_fields,
                 )
-                self.log("\n=> XONG! File da luu tai:\n" + out_path)
-                self.log("\nLuu y: mo file bang Excel, bam Ctrl+Alt+F9 (hoac File > Options > "
-                          "cho phep tinh toan lai) de Excel tinh lai toan bo cong thuc.")
-                messagebox.showinfo("Hoan tat", "Da tao file DEBIT hoan chinh thanh cong!")
+                if result is None:
+                    # Nguoi dung da chon "Co" trong hop thoai canh bao
+                    # ZERO_CHECK_FIELDS -> lan nay KHONG co file nao duoc
+                    # tao. Khong duoc bao "XONG" trong truong hop nay.
+                    self.log("\n=> DA BO QUA: chua tao file debit_editted lan nay "
+                              "vi phat hien du lieu bat thuong o cac truong "
+                              "ZERO_CHECK_FIELDS (xem canh bao ben tren).")
+                    self.log("Vui long kiem tra lai file debit goc / ct.xlsx roi bam "
+                              "CHAY lai.")
+                    messagebox.showwarning(
+                        "Chua tao file",
+                        "Da bo qua buoc tao file lan nay do phat hien du lieu bat "
+                        "thuong o cac truong ZERO_CHECK_FIELDS.\n"
+                        "Vui long kiem tra lai du lieu dau vao roi thu lai.",
+                    )
+                else:
+                    self.log("\n=> XONG! File da luu tai:\n" + result)
+                    self.log("\nLuu y: mo file bang Excel, bam Ctrl+Alt+F9 (hoac File > Options > "
+                              "cho phep tinh toan lai) de Excel tinh lai toan bo cong thuc.")
+                    messagebox.showinfo("Hoan tat", "Da tao file DEBIT hoan chinh thanh cong!")
             except Exception as e:
                 self.log("\nLOI: " + str(e))
                 self.log(traceback.format_exc())
