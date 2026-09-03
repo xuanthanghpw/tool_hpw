@@ -9,6 +9,7 @@ import time
 import os
 import random
 import tempfile
+import concurrent.futures
 from openpyxl.styles import PatternFill, Font
 
 try:
@@ -110,6 +111,46 @@ class SmartyApp:
             "headers": headers,
             "index": i,
         }
+
+    def _warmup_proxies(self):
+        """'Đánh thức' từng proxy TRƯỚC khi bắt đầu xử lý dòng thật, thay vì để dòng
+        đầu tiên lãnh đủ hàng loạt lỗi timeout. Nhiều proxy (đặc biệt proxy free/dùng
+        chung) có kết nối 'nguội': lần chạm đầu tiên tới 1 proxy mới phải bắt tay
+        TCP/TLS lại từ đầu (và nếu đó là proxy xoay IP/dạng gateway thì backend có
+        thể cần thời gian để cấp phiên mới) nên hay timeout, nhưng các lần sau đó
+        thường ổn định. Việc này chạy song song, timeout ngắn, và CHỈ in 1 dòng
+        tổng kết cuối cùng - không in từng lỗi riêng lẻ để tránh gây cảm giác
+        "app bị lỗi liên tục" ngay khi vừa bắt đầu."""
+        if not self.proxy_list:
+            return
+
+        self.log(f"Đang khởi động {len(self.proxy_list)} proxy trước khi xử lý (có thể mất vài giây)...")
+
+        def _check(proxy_url):
+            try:
+                requests.get(
+                    "https://www.smarty.com/",
+                    proxies={"http": proxy_url, "https": proxy_url},
+                    timeout=8,
+                )
+                return True
+            except requests.exceptions.RequestException:
+                return False
+
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(self.proxy_list))) as executor:
+            futures = [executor.submit(_check, p) for p in self.proxy_list]
+            for fut in concurrent.futures.as_completed(futures, timeout=20):
+                try:
+                    results.append(fut.result())
+                except Exception:
+                    results.append(False)
+
+        ok_count = sum(1 for r in results if r)
+        self.log(
+            f"Đã khởi động xong proxy: {ok_count}/{len(self.proxy_list)} phản hồi tốt "
+            f"(số còn lại vẫn sẽ được thử lại tự động trong lúc chạy nếu cần)."
+        )
 
     def setup_gui(self):
         frame_top = tk.Frame(self.root)
@@ -337,6 +378,9 @@ class SmartyApp:
             total_rows = len(df)
             match_mode = self.match_mode_var.get()
             self.log(f"Chế độ khớp Smarty: {match_mode.upper()}" + (" (khuyến khích)" if match_mode == "strict" else ""))
+
+            self._warmup_proxies()
+
             self.log(f"Bắt đầu giai đoạn 1: Gọi API Smarty ({total_rows} dòng)...")
 
             f_handle = self._open_output_txt_with_retry(self.txt_output_path)
@@ -410,8 +454,11 @@ class SmartyApp:
                     item["_analysis_reasons"] = all_reasons
                     collected_data.append(item)
 
-                    self.log(f"Smarty API - Dòng {index + 1}/{total_rows} -> OK")
-                    
+                    if outcome.get("success"):
+                        self.log(f"Smarty API - Dòng {index + 1}/{total_rows} -> OK")
+                    else:
+                        self.log(f"Smarty API - Dòng {index + 1}/{total_rows} -> LỖI: {result_string}")
+
                     # Chỉ delay nếu không dùng proxy hoặc đang chạy luồng bình thường
                     if delay_seconds > 0:
                         time.sleep(delay_seconds)
@@ -1122,6 +1169,7 @@ Danh sách đầu vào (JSON):
                     "analysis": {},
                     "rate_limited": rate_limited,
                     "status_code": res.status_code,
+                    "success": False,
                 }
 
             data = res.json()
@@ -1131,20 +1179,20 @@ Danh sách đầu vào (JSON):
                 ll = c.get("last_line", "")
                 result_string = f"{dl} {ll}".strip() if dl or ll else "Không tìm thấy delivery_line_1 hoặc last_line"
                 analysis = c.get("analysis", {}) or {}
-                return {"result": result_string, "analysis": analysis, "rate_limited": False, "status_code": 200}
-            return {"result": "Không tìm thấy kết quả từ Server", "analysis": {}, "rate_limited": False, "status_code": 200}
+                return {"result": result_string, "analysis": analysis, "rate_limited": False, "status_code": 200, "success": True}
+            return {"result": "Không tìm thấy kết quả từ Server", "analysis": {}, "rate_limited": False, "status_code": 200, "success": False}
         except requests.exceptions.RequestException as e:
             # Lỗi mạng/timeout/kết nối: đây thường là lỗi TẠM THỜI (proxy chập chờn, mạng lag...),
             # KHÔNG phải lỗi do dữ liệu địa chỉ sai -> phải được retry giống như rate-limit,
             # nếu không sẽ bỏ sót cả những dòng đáng ra hợp lệ chỉ vì 1 lần mạng bị giật.
             return {
                 "result": f"Lỗi mạng / Timeout: {str(e)[:120]}",
-                "analysis": {}, "rate_limited": False, "network_error": True, "status_code": None,
+                "analysis": {}, "rate_limited": False, "network_error": True, "status_code": None, "success": False,
             }
         except json.JSONDecodeError:
             return {
                 "result": "Lỗi phân tích JSON",
-                "analysis": {}, "rate_limited": False, "network_error": True, "status_code": None,
+                "analysis": {}, "rate_limited": False, "network_error": True, "status_code": None, "success": False,
             }
 
     def call_smarty_api_with_retry(self, street_input, max_retries, row_num):
@@ -1188,6 +1236,7 @@ Danh sách đầu vào (JSON):
         return {
             "result": "Lỗi: Quá nhiều request (đã xoay vòng Proxy/User-Agent/Key nhưng vẫn bị giới hạn hoặc lỗi mạng liên tục)",
             "analysis": {},
+            "success": False,
         }
 
     # ---- Bảng mã tra cứu chính thức của Smarty (US Street API) ----
