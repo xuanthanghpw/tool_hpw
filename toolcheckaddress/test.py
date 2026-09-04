@@ -11,6 +11,9 @@ import random
 import tempfile
 import concurrent.futures
 import webbrowser
+import sys
+import socket
+from urllib.parse import urlparse
 from openpyxl.styles import PatternFill, Font
 
 try:
@@ -22,6 +25,14 @@ except ImportError:
 
 API_URL = "https://us-street.api.smarty.com/street-address"
 DEFAULT_SMARTY_KEY = "21102174564513388"
+
+APP_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+DATA_DIR = os.path.join(APP_DIR, "data")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except OSError:
+    DATA_DIR = os.path.join(os.getenv("LOCALAPPDATA", APP_DIR), "SmartyAddressTool", "data")
+    os.makedirs(DATA_DIR, exist_ok=True)
 
 # Pool User-Agent để xoay vòng theo từng request/attempt, tránh bị nhận diện
 # là 1 "client" cố định gửi liên tục -> giảm khả năng dính "Too many requests".
@@ -59,6 +70,7 @@ GEMINI_FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.5
 # gian + có thể dính rate-limit lại). File này được ghi đè mỗi khi có 1 phiên xử lý/kiểm
 # tra lại mới hoàn tất, để luôn phản ánh phiên GẦN NHẤT.
 SESSION_STATE_FILE = "smarty_last_session.json"
+ADDRESS_CACHE_FILE = "smarty_address_cache.json"
 
 class SmartyApp:
     def __init__(self, root):
@@ -69,6 +81,9 @@ class SmartyApp:
         self.excel_path = ""
         self.output_dir = ""
         self.stop_requested = False
+
+        self.session_state_dir = DATA_DIR
+        self._migrate_legacy_data_files()
 
         self.session = requests.Session()
         self.gemini_client = None
@@ -90,10 +105,6 @@ class SmartyApp:
         # nhất có thể đã hết quota (bị 429 liên tục nhiều lần dù đã đổi proxy/User-Agent).
         self._warned_single_key_session = False
 
-        # File phiên cũ luôn được lưu ở thư mục làm việc hiện tại (cùng nơi với proxies.txt/
-        # smarty_keys.txt), để mở lại tool ở máy đó lúc nào cũng thấy được phiên gần nhất.
-        self.session_state_dir = os.getcwd()
-
         self.setup_gui()
         # Ngay khi mở tool, dò xem có phiên cũ (đã lưu từ lần chạy trước) hay không, để
         # hiện nút "Kiểm tra lại" nếu có -> người dùng có thể kiểm tra lại BẤT CỨ LÚC NÀO,
@@ -101,8 +112,9 @@ class SmartyApp:
         self._refresh_recheck_button()
 
     def _load_proxies(self):
-        if os.path.exists("proxies.txt"):
-            with open("proxies.txt", "r", encoding="utf-8") as f:
+        path = os.path.join(self.session_state_dir, "proxies.txt")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
                 return [line.strip() for line in f if line.strip()]
         return []
 
@@ -110,12 +122,33 @@ class SmartyApp:
         """Tuỳ chọn: nếu có file smarty_keys.txt (mỗi dòng 1 key Smarty),
         tool sẽ XOAY VÒNG nhiều key cùng với Proxy/User-Agent để né rate-limit
         triệt để hơn. Nếu không có file, dùng key mặc định."""
-        if os.path.exists("smarty_keys.txt"):
-            with open("smarty_keys.txt", "r", encoding="utf-8") as f:
+        path = os.path.join(self.session_state_dir, "smarty_keys.txt")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
                 keys = [line.strip() for line in f if line.strip()]
             if keys:
                 return keys
         return [DEFAULT_SMARTY_KEY]
+
+    def _migrate_legacy_data_files(self):
+        for filename in (
+            "proxies.txt",
+            "smarty_keys.txt",
+            SESSION_STATE_FILE,
+            ADDRESS_CACHE_FILE,
+        ):
+            target = os.path.join(self.session_state_dir, filename)
+            if os.path.exists(target):
+                continue
+            for legacy_dir in (os.getcwd(), APP_DIR):
+                source = os.path.join(legacy_dir, filename)
+                if source == target or not os.path.exists(source):
+                    continue
+                try:
+                    os.replace(source, target)
+                except OSError:
+                    pass
+                break
 
     def _pick_available(self, values, status_dict, counter_attr):
         """Chọn 1 phần tử từ 'values' (danh sách key hoặc proxy), ƯU TIÊN các phần tử KHÔNG
@@ -184,6 +217,22 @@ class SmartyApp:
             return f"proxy #{self.proxy_list.index(proxy_url)}"
         except ValueError:
             return "proxy (?)"
+
+    def _request_route_label(self, proxy_url):
+        if not proxy_url:
+            return "IP thật (không qua proxy)"
+        try:
+            parsed = urlparse(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
+            host = parsed.hostname or "?"
+            try:
+                resolved_ip = socket.gethostbyname(host)
+                host_text = f"{host} ({resolved_ip})" if resolved_ip != host else host
+            except socket.gaierror:
+                host_text = host
+            port_text = f":{parsed.port}" if parsed.port else ""
+            return f"{self._proxy_label(proxy_url)} - {host_text}{port_text}"
+        except ValueError:
+            return f"{self._proxy_label(proxy_url)} - {proxy_url}"
 
     def _next_identity(self):
         """Trả về 1 'danh tính' request mới: Proxy + Smarty Key + User-Agent + Accept-Language.
@@ -377,6 +426,16 @@ class SmartyApp:
         self.btn_stop = tk.Button(frame_btns, text="Dừng lại", command=self.stop_processing, width=10, bg="#dc3545", fg="white", font=("Arial", 11, "bold"), state=tk.DISABLED)
         self.btn_stop.pack(side="left", padx=5)
 
+        self.btn_clear_cache = tk.Button(
+            frame_btns, text="Xóa cache địa chỉ", command=self.clear_address_cache,
+            width=17, bg="#6c757d", fg="white", font=("Arial", 10, "bold")
+        )
+        self.btn_clear_cache.pack(side="left", padx=5)
+
+        self.lbl_cache_info = tk.Label(self.root, text="", fg="gray", font=("Arial", 8))
+        self.lbl_cache_info.pack(anchor="w", padx=10, pady=(0, 3))
+        self._refresh_cache_info()
+
         # ----- Khu vực "Kiểm tra lại phiên cũ" -----
         # Khung này LUÔN tồn tại nhưng RỖNG (không có gì bên trong) nếu chưa từng có phiên
         # nào được lưu. Nút "Kiểm tra lại (<n> dòng)" chỉ được pack() vào khung này khi
@@ -419,6 +478,34 @@ class SmartyApp:
         self.log_text.see(tk.END)
         self.root.update_idletasks()
 
+    def _refresh_cache_info(self):
+        path = os.path.join(self.session_state_dir, ADDRESS_CACHE_FILE)
+        if not os.path.exists(path):
+            self.lbl_cache_info.config(text="Cache địa chỉ: chưa có dữ liệu")
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            count = len(data) if isinstance(data, dict) else 0
+            updated_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
+            self.lbl_cache_info.config(text=f"Cache địa chỉ: {count} bản ghi | Cập nhật: {updated_at}")
+        except (OSError, json.JSONDecodeError):
+            self.lbl_cache_info.config(text="Cache địa chỉ: không đọc được dữ liệu")
+
+    def clear_address_cache(self):
+        path = os.path.join(self.session_state_dir, ADDRESS_CACHE_FILE)
+        if not os.path.exists(path):
+            self._refresh_cache_info()
+            return
+        if not messagebox.askyesno("Xóa cache", "Xóa toàn bộ cache địa chỉ Smarty đã lưu?\n\nLần chạy sau sẽ gọi lại Smarty cho các địa chỉ này."):
+            return
+        try:
+            os.remove(path)
+            self._refresh_cache_info()
+            self.log("[CACHE] Đã xóa toàn bộ cache địa chỉ Smarty.")
+        except OSError as e:
+            messagebox.showerror("Lỗi xóa cache", f"Không thể xóa cache:\n{e}")
+
     def select_excel(self):
         file_path = filedialog.askopenfilename(title="Chọn file Excel", filetypes=[("Excel files", "*.xlsx *.xls")])
         if file_path:
@@ -435,8 +522,8 @@ class SmartyApp:
             else:
                 self.log(
                     "Chỉ đang dùng 1 API Key Smarty duy nhất (mặc định, không có smarty_keys.txt). "
-                    "Nếu bị giới hạn request (429) liên tục, hãy tạo file 'smarty_keys.txt' cùng thư mục "
-                    "với tool (mỗi dòng 1 API Key khác) để tool TỰ ĐỘNG xoay vòng nhiều key, né key đã hết quota."
+                    "Nếu Smarty trả về 429, tool sẽ dừng an toàn để không phát sinh thêm request bị chặn. "
+                    "Hãy kiểm tra quota hoặc cấu hình API key hợp lệ trong thư mục data."
                 )
             self.log(f"Đang xoay vòng {len(USER_AGENT_POOL)} User-Agent khác nhau cho mỗi request.")
 
@@ -447,6 +534,40 @@ class SmartyApp:
 
     def _session_file_path(self):
         return os.path.join(self.session_state_dir, SESSION_STATE_FILE)
+
+    def _address_cache_key(self, street_input, match_mode):
+        normalized = " ".join(str(street_input).split()).casefold()
+        return f"{match_mode}|{normalized}"
+
+    def _load_address_cache(self, match_mode):
+        path = os.path.join(self.session_state_dir, ADDRESS_CACHE_FILE)
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            prefix = f"{match_mode}|"
+            return {key: value for key, value in data.items() if key.startswith(prefix) and isinstance(value, dict)}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_address_cache(self, cache):
+        path = os.path.join(self.session_state_dir, ADDRESS_CACHE_FILE)
+        try:
+            all_cache = {}
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    stored = json.load(f)
+                if isinstance(stored, dict):
+                    all_cache.update(stored)
+            all_cache.update(cache)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(all_cache, f, ensure_ascii=False)
+            self.root.after(0, self._refresh_cache_info)
+        except (OSError, json.JSONDecodeError) as e:
+            self.log(f"    [!] Không lưu được cache Smarty: {e}")
 
     def _save_session_to_disk(self, collected_data, source_excel_path="", output_excel_path=""):
         """Ghi đè lại file phiên gần nhất trên đĩa. Lưu TOÀN BỘ collected_data (bao gồm cả
@@ -610,6 +731,7 @@ class SmartyApp:
         self.btn_start.config(state=tk.DISABLED, text="Đang xử lý...")
         self.btn_select_excel.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
+        self.btn_clear_cache.config(state=tk.DISABLED)
         self.entry_delay.config(state=tk.DISABLED)
         self.rb_match_strict.config(state=tk.DISABLED)
         self.rb_match_enhanced.config(state=tk.DISABLED)
@@ -620,6 +742,7 @@ class SmartyApp:
 
     def process_data(self):
         collected_data = []
+        rate_limit_triggered = False
 
         # Bắt đầu 1 phiên gọi Smarty mới -> reset lại trạng thái xoay vòng key/proxy (cooldown)
         # về sạch, vì người dùng có thể đã bổ sung thêm key mới/đợi qua giới hạn từ lần trước.
@@ -648,9 +771,13 @@ class SmartyApp:
             match_mode = self.match_mode_var.get()
             self.log(f"Chế độ khớp Smarty: {match_mode.upper()}" + (" (khuyến khích)" if match_mode == "strict" else ""))
 
-            self._warmup_proxies()
-
             self.log(f"Bắt đầu giai đoạn 1: Gọi API Smarty ({total_rows} dòng)...")
+
+            # Một file thường có nhiều dòng dùng chung một địa chỉ. Cache trong phiên giúp
+            # mỗi chuỗi địa chỉ chỉ gọi Smarty tối đa một lần, kể cả sau khi mở lại tool.
+            smarty_cache = self._load_address_cache(match_mode)
+            cache_dirty = False
+            new_cache_count = 0
 
             f_handle = self._open_output_txt_with_retry(self.txt_output_path)
             self.txt_output_path = f_handle.name
@@ -679,7 +806,21 @@ class SmartyApp:
                     if not input_string:
                         continue
 
-                    outcome = self.call_smarty_api_with_retry(input_string, 10, index+1)
+                    cache_key = self._address_cache_key(input_string, match_mode)
+                    used_cache = False
+                    if cache_key in smarty_cache:
+                        outcome = smarty_cache[cache_key].copy()
+                        used_cache = True
+                    else:
+                        outcome = self.call_smarty_api_with_retry(input_string, 3, index+1)
+                        request_proxy = outcome.pop("_proxy_url", None)
+                        rate_limit_triggered = outcome.get("rate_limit_stop", False)
+                        if outcome.get("status_code") == 200:
+                            smarty_cache[cache_key] = outcome.copy()
+                            cache_dirty = True
+                            new_cache_count += 1
+                            if new_cache_count % 50 == 0:
+                                self._save_address_cache(smarty_cache)
                     result_string = outcome.get("result", "")
                     analysis = outcome.get("analysis", {}) or {}
 
@@ -736,14 +877,32 @@ class SmartyApp:
                     item["_analysis_reasons"] = all_reasons
                     collected_data.append(item)
 
-                    if outcome.get("success"):
-                        self.log(f"Smarty API - Dòng {index + 1}/{total_rows} -> OK")
+                    if used_cache:
+                        self.log(f"Smarty API - Dòng {index + 1}/{total_rows} -> dùng kết quả cache (không tạo request)")
+                    elif outcome.get("success"):
+                        self.log(
+                            f"Smarty API - Dòng {index + 1}/{total_rows} -> OK | "
+                            f"{self._request_route_label(request_proxy)}"
+                        )
                     else:
-                        self.log(f"Smarty API - Dòng {index + 1}/{total_rows} -> LỖI: {result_string}")
+                        self.log(
+                            f"Smarty API - Dòng {index + 1}/{total_rows} -> LỖI: {result_string} | "
+                            f"{self._request_route_label(request_proxy)}"
+                        )
+
+                    if rate_limit_triggered:
+                        self.log(
+                            "[DỪNG AN TOÀN] Smarty đã trả về 429. Đã dừng gọi API ngay để không tiếp tục "
+                            "phát sinh request bị chặn; phần kết quả đã xử lý vẫn sẽ được xuất."
+                        )
+                        break
 
                     # Chỉ delay nếu không dùng proxy hoặc đang chạy luồng bình thường
                     if delay_seconds > 0:
                         time.sleep(delay_seconds)
+
+                if cache_dirty:
+                    self._save_address_cache(smarty_cache)
 
                 if not self.stop_requested:
                     gpt_prompt = """
@@ -768,7 +927,7 @@ TUYỆT ĐỐI KHÔNG đưa các đơn hàng hoàn toàn hợp lệ (không lỗ
                     f_out.write(gpt_prompt)
                     f_out.flush()
 
-            if self.use_ai_var.get() and not self.stop_requested and collected_data:
+            if self.use_ai_var.get() and not self.stop_requested and not rate_limit_triggered and collected_data:
                 self.log("\n===========================================")
                 self.log("Bắt đầu giai đoạn 2: Kiểm tra kết quả đáng ngờ bằng AI...")
 
@@ -800,8 +959,16 @@ TUYỆT ĐỐI KHÔNG đưa các đơn hàng hoàn toàn hợp lệ (không lỗ
                 self.root.after(0, self._refresh_recheck_button)
 
             if not self.stop_requested:
-                self.log(f"\n[THÀNH CÔNG] Toàn bộ tiến trình hoàn tất!")
-                messagebox.showinfo("Hoàn tất", f"Đã xuất thành công:\n1. {self.txt_output_path}\n2. {self.excel_output_path}")
+                if rate_limit_triggered:
+                    self.log("\n[ĐÃ DỪNG] Đã xuất phần dữ liệu trước thời điểm Smarty giới hạn request.")
+                    messagebox.showwarning(
+                        "Smarty đang giới hạn request",
+                        f"Đã xuất phần dữ liệu đã xử lý:\n{self.excel_output_path}\n\n"
+                        "Hãy chờ quota hồi phục hoặc dùng API key hợp lệ khác trước khi chạy tiếp."
+                    )
+                else:
+                    self.log(f"\n[THÀNH CÔNG] Toàn bộ tiến trình hoàn tất!")
+                    messagebox.showinfo("Hoàn tất", f"Đã xuất thành công:\n1. {self.txt_output_path}\n2. {self.excel_output_path}")
 
         except Exception as e:
             self.log(f"\n[LỖI] Đã xảy ra sự cố: {e}")
@@ -1531,6 +1698,7 @@ Danh sách đầu vào (JSON):
                 # và proxy này vẫn "khỏe", xóa cờ nghi ngờ để lần sau lại được ưu tiên chọn.
                 self._mark_key_success(api_key)
                 self._mark_proxy_success(proxy_url)
+                outcome["_proxy_url"] = proxy_url
                 return outcome
 
             key_label = self._mask_key(api_key)
@@ -1539,27 +1707,12 @@ Danh sách đầu vào (JSON):
             if is_rate_limited:
                 cooldown, fail_streak = self._mark_key_rate_limited(api_key)
                 self.log(
-                    f"  [!] Dòng {row_num}: Bị giới hạn request (lần {attempt + 1}/{max_retries}, "
-                    f"key {key_label}, {proxy_label}). Tạm khóa key này ~{cooldown:.0f}s, đang tự đổi "
-                    f"sang key/proxy khác..."
+                    f"  [!] Dòng {row_num}: Smarty trả về 429 với key {key_label}, {proxy_label}. "
+                    f"Kích hoạt dừng an toàn; không retry và không đổi proxy để tránh phát sinh thêm request."
                 )
-
-                # Phát hiện SỚM dấu hiệu "key duy nhất đã hết quota": nếu chỉ có 1 API Key và
-                # nó bị 429 liên tục nhiều lần (>= 3 lần liên tiếp TÍNH TỪ ĐẦU dòng này), gần
-                # như chắc chắn là do KEY (không phải proxy, vì mỗi lần đã đổi proxy khác nhau
-                # mà vẫn bị chặn) -> cảnh báo rõ ràng 1 LẦN/phiên, tránh người dùng tưởng lỗi do
-                # proxy rồi loay hoay đổi proxy mãi không có tác dụng.
-                if only_one_key:
-                    fail_streak_this_row = fail_streak - single_key_fail_streak_at_row_start
-                    if fail_streak_this_row >= 3 and not self._warned_single_key_session:
-                        self._warned_single_key_session = True
-                        self.log(
-                            "  [CẢNH BÁO] Bạn đang chỉ dùng 1 API Key Smarty duy nhất và key này bị giới hạn "
-                            "LIÊN TỤC dù đã đổi nhiều proxy/User-Agent khác nhau -> đây là dấu hiệu rất rõ "
-                            "cho thấy CHÍNH KEY đã hết quota/hạn mức (Smarty giới hạn theo Key, không phải "
-                            "theo IP). Hãy kiểm tra quota trên tài khoản Smarty, hoặc tạo file 'smarty_keys.txt' "
-                            "(mỗi dòng 1 API Key khác) để tool tự động xoay vòng nhiều key."
-                        )
+                outcome["_proxy_url"] = proxy_url
+                outcome["rate_limit_stop"] = True
+                return outcome
             else:
                 cooldown = self._mark_proxy_issue(proxy_url)
                 self.log(
@@ -1587,6 +1740,7 @@ Danh sách đầu vào (JSON):
         return {
             "result": f"Lỗi: Quá nhiều request (đã xoay vòng Proxy/User-Agent/Key nhưng vẫn bị giới hạn hoặc lỗi mạng liên tục){hint}",
             "analysis": {},
+            "_proxy_url": proxy_url if 'proxy_url' in locals() else None,
             "success": False,
         }
 
@@ -1818,6 +1972,7 @@ Danh sách đầu vào (JSON):
         self.btn_start.config(state=tk.NORMAL, text="2. Bắt đầu xử lý & Xuất file (TXT + Excel)")
         self.btn_select_excel.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.DISABLED)
+        self.btn_clear_cache.config(state=tk.NORMAL)
         self.entry_delay.config(state=tk.NORMAL)
         self.rb_match_strict.config(state=tk.NORMAL)
         self.rb_match_enhanced.config(state=tk.NORMAL)
