@@ -9,7 +9,6 @@ import time
 import os
 import random
 import tempfile
-import concurrent.futures
 import webbrowser
 import sys
 import socket
@@ -27,6 +26,8 @@ API_URL = "https://us-street.api.smarty.com/street-address"
 DEFAULT_SMARTY_KEY = "21102174564513388"
 MIN_SMARTY_REQUEST_INTERVAL = 10.0
 STABLE_USER_AGENT = "smarty-address-tool/1.0"
+MAX_SMARTY_BACKOFF_SECONDS = 300
+MAX_RATE_LIMIT_RETRIES = 1
 
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
@@ -35,27 +36,6 @@ try:
 except OSError:
     DATA_DIR = os.path.join(os.getenv("LOCALAPPDATA", APP_DIR), "SmartyAddressTool", "data")
     os.makedirs(DATA_DIR, exist_ok=True)
-
-# Pool User-Agent để xoay vòng theo từng request/attempt, tránh bị nhận diện
-# là 1 "client" cố định gửi liên tục -> giảm khả năng dính "Too many requests".
-USER_AGENT_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edg/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-]
-
-ACCEPT_LANGUAGE_POOL = [
-    "en-US,en;q=0.9",
-    "en-US,en;q=0.8,vi;q=0.5",
-    "en-GB,en;q=0.9",
-    "en-US,en;q=0.9,fr;q=0.6",
-    "en-CA,en;q=0.9",
-]
 
 GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 OPENROUTER_MODELS = [
@@ -89,6 +69,8 @@ class SmartyApp:
 
         self.session = requests.Session()
         self._last_smarty_request_at = 0.0
+        self._smarty_backoff_until = 0.0
+        self._smarty_rate_limit_streak = 0
         self.gemini_client = None
         self.proxy_list = self._load_proxies()
         self.api_key_list = self._load_api_keys()
@@ -263,46 +245,6 @@ class SmartyApp:
             "headers": headers,
             "index": i,
         }
-
-    def _warmup_proxies(self):
-        """'Đánh thức' từng proxy TRƯỚC khi bắt đầu xử lý dòng thật, thay vì để dòng
-        đầu tiên lãnh đủ hàng loạt lỗi timeout. Nhiều proxy (đặc biệt proxy free/dùng
-        chung) có kết nối 'nguội': lần chạm đầu tiên tới 1 proxy mới phải bắt tay
-        TCP/TLS lại từ đầu (và nếu đó là proxy xoay IP/dạng gateway thì backend có
-        thể cần thời gian để cấp phiên mới) nên hay timeout, nhưng các lần sau đó
-        thường ổn định. Việc này chạy song song, timeout ngắn, và CHỈ in 1 dòng
-        tổng kết cuối cùng - không in từng lỗi riêng lẻ để tránh gây cảm giác
-        "app bị lỗi liên tục" ngay khi vừa bắt đầu."""
-        if not self.proxy_list:
-            return
-
-        self.log(f"Đang khởi động {len(self.proxy_list)} proxy trước khi xử lý (có thể mất vài giây)...")
-
-        def _check(proxy_url):
-            try:
-                requests.get(
-                    "https://www.smarty.com/",
-                    proxies={"http": proxy_url, "https": proxy_url},
-                    timeout=8,
-                )
-                return True
-            except requests.exceptions.RequestException:
-                return False
-
-        results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(self.proxy_list))) as executor:
-            futures = [executor.submit(_check, p) for p in self.proxy_list]
-            for fut in concurrent.futures.as_completed(futures, timeout=20):
-                try:
-                    results.append(fut.result())
-                except Exception:
-                    results.append(False)
-
-        ok_count = sum(1 for r in results if r)
-        self.log(
-            f"Đã khởi động xong proxy: {ok_count}/{len(self.proxy_list)} phản hồi tốt "
-            f"(số còn lại vẫn sẽ được thử lại tự động trong lúc chạy nếu cần)."
-        )
 
     def setup_gui(self):
         frame_top = tk.Frame(self.root)
@@ -525,7 +467,7 @@ class SmartyApp:
             else:
                 self.log(
                     "Chỉ đang dùng 1 API Key Smarty duy nhất (mặc định, không có smarty_keys.txt). "
-                    "Nếu Smarty trả về 429, tool sẽ dừng an toàn để không phát sinh thêm request bị chặn. "
+                    "Nếu Smarty trả về 429, tool sẽ tự chờ theo cooldown rồi thử lại; không đổi proxy để spam request. "
                     "Hãy kiểm tra quota hoặc cấu hình API key hợp lệ trong thư mục data."
                 )
             self.log(
@@ -757,6 +699,8 @@ class SmartyApp:
         self._key_rr_counter = 0
         self._proxy_rr_counter = 0
         self._warned_single_key_session = False
+        self._smarty_backoff_until = 0.0
+        self._smarty_rate_limit_streak = 0
 
         try:
             delay_seconds = float(self.delay_var.get())
@@ -821,7 +765,13 @@ class SmartyApp:
                         outcome = self.call_smarty_api_with_retry(input_string, 3, index+1)
                         request_proxy = outcome.pop("_proxy_url", None)
                         if outcome.get("stopped"):
-                            self.log("[DỪNG] Người dùng đã dừng trước khi tất cả địa chỉ có kết quả.")
+                            if outcome.get("rate_limit_exhausted"):
+                                self.log(
+                                    "[DỪNG] Smarty vẫn giới hạn request sau lần thử lại. "
+                                    "Không tiếp tục chờ để tránh làm người dùng mất thời gian."
+                                )
+                            else:
+                                self.log("[DỪNG] Người dùng đã dừng trước khi tất cả địa chỉ có kết quả.")
                             break
                         if outcome.get("status_code") != 200:
                             unresolved_error = True
@@ -1634,6 +1584,7 @@ Danh sách đầu vào (JSON):
         try:
             elapsed = time.monotonic() - self._last_smarty_request_at
             wait_for = MIN_SMARTY_REQUEST_INTERVAL - elapsed
+            wait_for = max(wait_for, self._smarty_backoff_until - time.monotonic())
             if wait_for > 0:
                 time.sleep(wait_for)
             self._last_smarty_request_at = time.monotonic()
@@ -1653,6 +1604,21 @@ Danh sách đầu vào (JSON):
                     msg = f"HTTP {res.status_code}"
                 if "too many requests" in msg.lower() or "rate limit" in msg.lower():
                     rate_limited = True
+                if rate_limited:
+                    self._smarty_rate_limit_streak += 1
+                    retry_after = res.headers.get("Retry-After", "")
+                    try:
+                        server_wait = int(retry_after)
+                    except (TypeError, ValueError):
+                        server_wait = 60
+                    backoff = min(
+                        max(server_wait, 60) * (2 ** (self._smarty_rate_limit_streak - 1)),
+                        MAX_SMARTY_BACKOFF_SECONDS,
+                    )
+                    self._smarty_backoff_until = max(
+                        self._smarty_backoff_until,
+                        time.monotonic() + backoff,
+                    )
                 return {
                     "result": f"Lỗi API: {msg}",
                     "analysis": {},
@@ -1691,6 +1657,7 @@ Danh sách đầu vào (JSON):
         # tạm thời không được phép lọt vào collected_data và xuất hiện trong Excel.
         network_wait = 5
         attempt = 0
+        rate_limit_retries = 0
         retry_identity = None
         while not self.stop_requested:
             attempt += 1
@@ -1722,6 +1689,17 @@ Danh sách đầu vào (JSON):
             proxy_label = self._proxy_label(proxy_url)
 
             if is_rate_limited:
+                if rate_limit_retries >= MAX_RATE_LIMIT_RETRIES:
+                    self.log(
+                        f"  [DỪNG] Dòng {row_num}: Smarty vẫn trả 429 sau "
+                        f"{MAX_RATE_LIMIT_RETRIES} lần thử lại; bỏ qua việc chờ lặp thêm."
+                    )
+                    outcome["_proxy_url"] = proxy_url
+                    outcome["rate_limit_exhausted"] = True
+                    outcome["stopped"] = True
+                    return outcome
+
+                rate_limit_retries += 1
                 retry_after = outcome.get("retry_after", "")
                 try:
                     wait_seconds = int(retry_after)
