@@ -1,6 +1,6 @@
 {
-  "updated_at": "2026-09-05 02:35:36",
-  "next_index": 36,
+  "updated_at": "2026-09-05 02:35:49",
+  "next_index": 37,
   "proxies": {
     "http://nvmkysmm:p3zqsarlu5wd@31.59.20.176:6754": {
       "blocked_until": 1788636683.538106,
@@ -27,8 +27,8 @@
       "fail_streak": 0
     },
     "http://nvmkysmm:p3zqsarlu5wd@142.111.67.146:5611": {
-      "blocked_until": 0.0,
-      "fail_streak": 0
+      "blocked_until": 1788636949.857468,
+      "fail_streak": 1
     },
     "http://nvmkysmm:p3zqsarlu5wd@191.96.254.138:6185": {
       "blocked_until": 0.0,

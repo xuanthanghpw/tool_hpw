@@ -55,7 +55,8 @@ GEMINI_FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.5
 SESSION_STATE_FILE = "smarty_last_session.json"
 ADDRESS_CACHE_FILE = "smarty_address_cache.json"
 PROXY_STATE_FILE = "proxy_state.json"
-PROXY_RATE_LIMIT_COOLDOWN_SECONDS = 24 * 60 * 60
+PROXY_RATE_LIMIT_BASE_COOLDOWN_SECONDS = 30 * 60
+PROXY_RATE_LIMIT_MAX_COOLDOWN_SECONDS = 4 * 60 * 60
 
 class SmartyApp:
     def __init__(self, root):
@@ -137,11 +138,18 @@ class SmartyApp:
                 next_index = int(next_index)
             except (TypeError, ValueError):
                 next_index = 0
-            return {
-                proxy: status
-                for proxy, status in states.items()
-                if proxy in self.proxy_list and isinstance(status, dict)
-            }, next_index
+            now = time.time()
+            loaded_states = {}
+            for proxy, status in states.items():
+                if proxy not in self.proxy_list or not isinstance(status, dict):
+                    continue
+                status = status.copy()
+                # Trạng thái cũ được tạo khi cooldown là 24 giờ; không giữ khóa quá dài
+                # sau khi nâng cấp cơ chế mới.
+                if status.get("blocked_until", 0) - now > PROXY_RATE_LIMIT_MAX_COOLDOWN_SECONDS:
+                    status["blocked_until"] = 0.0
+                loaded_states[proxy] = status
+            return loaded_states, next_index
         except (OSError, json.JSONDecodeError):
             return {}, 0
 
@@ -236,9 +244,13 @@ class SmartyApp:
             return
         st = self.proxy_status.setdefault(proxy_url, {"blocked_until": 0.0, "fail_streak": 0})
         st["fail_streak"] += 1
-        st["blocked_until"] = time.time() + PROXY_RATE_LIMIT_COOLDOWN_SECONDS
+        cooldown = min(
+            PROXY_RATE_LIMIT_BASE_COOLDOWN_SECONDS * (2 ** (st["fail_streak"] - 1)),
+            PROXY_RATE_LIMIT_MAX_COOLDOWN_SECONDS,
+        )
+        st["blocked_until"] = time.time() + cooldown
         self._save_proxy_state()
-        return PROXY_RATE_LIMIT_COOLDOWN_SECONDS
+        return cooldown
 
     def _mark_proxy_success(self, proxy_url):
         if not proxy_url:
