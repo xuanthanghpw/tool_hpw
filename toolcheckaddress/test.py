@@ -25,6 +25,8 @@ except ImportError:
 
 API_URL = "https://us-street.api.smarty.com/street-address"
 DEFAULT_SMARTY_KEY = "21102174564513388"
+MIN_SMARTY_REQUEST_INTERVAL = 10.0
+STABLE_USER_AGENT = "smarty-address-tool/1.0"
 
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
@@ -86,6 +88,7 @@ class SmartyApp:
         self._migrate_legacy_data_files()
 
         self.session = requests.Session()
+        self._last_smarty_request_at = 0.0
         self.gemini_client = None
         self.proxy_list = self._load_proxies()
         self.api_key_list = self._load_api_keys()
@@ -245,8 +248,8 @@ class SmartyApp:
 
         proxy_url = self._pick_available(self.proxy_list, self.proxy_status, "_proxy_rr_counter")
         api_key = self._pick_available(self.api_key_list, self.key_status, "_key_rr_counter")
-        user_agent = USER_AGENT_POOL[i % len(USER_AGENT_POOL)]
-        accept_language = ACCEPT_LANGUAGE_POOL[i % len(ACCEPT_LANGUAGE_POOL)]
+        user_agent = STABLE_USER_AGENT
+        accept_language = "en-US,en;q=0.9"
 
         headers = {
             "Referer": "https://www.smarty.com/",
@@ -317,7 +320,7 @@ class SmartyApp:
         lbl_delay = tk.Label(frame_delay, text="Độ trễ API Smarty (giây):", font=("Arial", 10, "bold"))
         lbl_delay.pack(side="left")
 
-        self.delay_var = tk.StringVar(value="2.0")
+        self.delay_var = tk.StringVar(value=str(MIN_SMARTY_REQUEST_INTERVAL))
         self.entry_delay = tk.Entry(frame_delay, textvariable=self.delay_var, width=8, font=("Consolas", 11), justify="center")
         self.entry_delay.pack(side="left", padx=10)
 
@@ -514,9 +517,9 @@ class SmartyApp:
             self.btn_start.config(state=tk.NORMAL)
             self.log(f"Đã chọn file: {self.excel_path}")
             if self.proxy_list:
-                self.log(f"Đã nạp {len(self.proxy_list)} proxy từ file proxies.txt (xoay vòng).")
+                self.log(f"Kết nối: dùng {len(self.proxy_list)} proxy từ data/proxies.txt; User-Agent cố định.")
             else:
-                self.log("Không có proxies.txt -> chỉ xoay vòng User-Agent/Key, khi bị chặn sẽ phải chờ (backoff).")
+                self.log("Kết nối: không có proxy, dùng IP thật; User-Agent cố định.")
             if len(self.api_key_list) > 1:
                 self.log(f"Đã nạp {len(self.api_key_list)} Smarty Key từ file smarty_keys.txt (xoay vòng).")
             else:
@@ -525,7 +528,10 @@ class SmartyApp:
                     "Nếu Smarty trả về 429, tool sẽ dừng an toàn để không phát sinh thêm request bị chặn. "
                     "Hãy kiểm tra quota hoặc cấu hình API key hợp lệ trong thư mục data."
                 )
-            self.log(f"Đang xoay vòng {len(USER_AGENT_POOL)} User-Agent khác nhau cho mỗi request.")
+            self.log(
+                f"Khoảng cách tối thiểu giữa các request Smarty: {MIN_SMARTY_REQUEST_INTERVAL:.0f} giây; "
+                "khi 429 sẽ tự chờ rồi thử lại."
+            )
 
     # ================================================================================
     # LƯU / ĐỌC PHIÊN LÀM VIỆC CŨ (để có thể "Kiểm tra lại" bất cứ lúc nào, không cần
@@ -742,7 +748,7 @@ class SmartyApp:
 
     def process_data(self):
         collected_data = []
-        rate_limit_triggered = False
+        unresolved_error = False
 
         # Bắt đầu 1 phiên gọi Smarty mới -> reset lại trạng thái xoay vòng key/proxy (cooldown)
         # về sạch, vì người dùng có thể đã bổ sung thêm key mới/đợi qua giới hạn từ lần trước.
@@ -814,7 +820,16 @@ class SmartyApp:
                     else:
                         outcome = self.call_smarty_api_with_retry(input_string, 3, index+1)
                         request_proxy = outcome.pop("_proxy_url", None)
-                        rate_limit_triggered = outcome.get("rate_limit_stop", False)
+                        if outcome.get("stopped"):
+                            self.log("[DỪNG] Người dùng đã dừng trước khi tất cả địa chỉ có kết quả.")
+                            break
+                        if outcome.get("status_code") != 200:
+                            unresolved_error = True
+                            self.log(
+                                f"[KHÔNG XUẤT EXCEL] Dòng {index + 1} chưa có phản hồi HTTP 200 "
+                                f"(HTTP {outcome.get('status_code')})."
+                            )
+                            break
                         if outcome.get("status_code") == 200:
                             smarty_cache[cache_key] = outcome.copy()
                             cache_dirty = True
@@ -890,13 +905,6 @@ class SmartyApp:
                             f"{self._request_route_label(request_proxy)}"
                         )
 
-                    if rate_limit_triggered:
-                        self.log(
-                            "[DỪNG AN TOÀN] Smarty đã trả về 429. Đã dừng gọi API ngay để không tiếp tục "
-                            "phát sinh request bị chặn; phần kết quả đã xử lý vẫn sẽ được xuất."
-                        )
-                        break
-
                     # Chỉ delay nếu không dùng proxy hoặc đang chạy luồng bình thường
                     if delay_seconds > 0:
                         time.sleep(delay_seconds)
@@ -927,7 +935,14 @@ TUYỆT ĐỐI KHÔNG đưa các đơn hàng hoàn toàn hợp lệ (không lỗ
                     f_out.write(gpt_prompt)
                     f_out.flush()
 
-            if self.use_ai_var.get() and not self.stop_requested and not rate_limit_triggered and collected_data:
+            if unresolved_error or self.stop_requested:
+                self.log(
+                    "\n[CHƯA HOÀN TẤT] Không xuất Excel vì vẫn còn dòng chưa nhận được kết quả rõ ràng. "
+                    "Hãy sửa kết nối/API rồi chạy lại; các dòng lỗi không được đưa vào file kết quả."
+                )
+                return
+
+            if self.use_ai_var.get() and not self.stop_requested and collected_data:
                 self.log("\n===========================================")
                 self.log("Bắt đầu giai đoạn 2: Kiểm tra kết quả đáng ngờ bằng AI...")
 
@@ -959,16 +974,8 @@ TUYỆT ĐỐI KHÔNG đưa các đơn hàng hoàn toàn hợp lệ (không lỗ
                 self.root.after(0, self._refresh_recheck_button)
 
             if not self.stop_requested:
-                if rate_limit_triggered:
-                    self.log("\n[ĐÃ DỪNG] Đã xuất phần dữ liệu trước thời điểm Smarty giới hạn request.")
-                    messagebox.showwarning(
-                        "Smarty đang giới hạn request",
-                        f"Đã xuất phần dữ liệu đã xử lý:\n{self.excel_output_path}\n\n"
-                        "Hãy chờ quota hồi phục hoặc dùng API key hợp lệ khác trước khi chạy tiếp."
-                    )
-                else:
-                    self.log(f"\n[THÀNH CÔNG] Toàn bộ tiến trình hoàn tất!")
-                    messagebox.showinfo("Hoàn tất", f"Đã xuất thành công:\n1. {self.txt_output_path}\n2. {self.excel_output_path}")
+                self.log(f"\n[THÀNH CÔNG] Toàn bộ tiến trình hoàn tất!")
+                messagebox.showinfo("Hoàn tất", f"Đã xuất thành công:\n1. {self.txt_output_path}\n2. {self.excel_output_path}")
 
         except Exception as e:
             self.log(f"\n[LỖI] Đã xảy ra sự cố: {e}")
@@ -1625,9 +1632,14 @@ Danh sách đầu vào (JSON):
         proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
 
         try:
+            elapsed = time.monotonic() - self._last_smarty_request_at
+            wait_for = MIN_SMARTY_REQUEST_INTERVAL - elapsed
+            if wait_for > 0:
+                time.sleep(wait_for)
+            self._last_smarty_request_at = time.monotonic()
+
             # Xoá cookie trước mỗi lần gọi để mỗi request trông như 1 phiên hoàn toàn mới,
             # tránh Smarty gộp nhiều request lại thành 1 "client" duy nhất qua cookie.
-            self.session.cookies.clear()
             res = self.session.get(
                 API_URL, params=params, headers=identity["headers"],
                 proxies=proxies, timeout=15
@@ -1646,6 +1658,8 @@ Danh sách đầu vào (JSON):
                     "analysis": {},
                     "rate_limited": rate_limited,
                     "status_code": res.status_code,
+                    "retry_after": res.headers.get("Retry-After", ""),
+                    "request_id": res.headers.get("X-Request-Id", ""),
                     "success": False,
                 }
 
@@ -1673,19 +1687,22 @@ Danh sách đầu vào (JSON):
             }
 
     def call_smarty_api_with_retry(self, street_input, max_retries, row_num):
-        base_wait = 1.5
-        only_one_key = len(self.api_key_list) == 1
-        single_key_fail_streak_at_row_start = self.key_status.get(self.api_key_list[0], {}).get("fail_streak", 0) if only_one_key else 0
-
-        for attempt in range(max_retries):
+        # Chỉ trả về khi Smarty phản hồi HTTP 200 hoặc người dùng bấm Dừng. Các lỗi
+        # tạm thời không được phép lọt vào collected_data và xuất hiện trong Excel.
+        network_wait = 5
+        attempt = 0
+        retry_identity = None
+        while not self.stop_requested:
+            attempt += 1
             if self.stop_requested:
-                return {"result": "Bị dừng", "analysis": {}}
+                return {"result": "Bị dừng", "analysis": {}, "stopped": True}
 
             # Mỗi LƯỢT GỌI (kể cả lần đầu, không chỉ khi bị chặn) đều dùng 1 danh tính mới:
             # proxy khác + Smarty key khác (nếu có) + User-Agent/Accept-Language khác. Việc
             # chọn key/proxy giờ LINH ĐỘNG (xem _next_identity/_pick_available): tự động né
             # những key/proxy vừa bị 429/lỗi mạng thay vì cứ lặp lại mù quáng.
-            identity = self._next_identity()
+            identity = retry_identity or self._next_identity()
+            retry_identity = None
             api_key = identity["api_key"]
             proxy_url = identity.get("proxy_url")
             outcome = self.call_smarty_api(street_input, identity)
@@ -1705,103 +1722,82 @@ Danh sách đầu vào (JSON):
             proxy_label = self._proxy_label(proxy_url)
 
             if is_rate_limited:
-                cooldown, fail_streak = self._mark_key_rate_limited(api_key)
+                retry_after = outcome.get("retry_after", "")
+                try:
+                    wait_seconds = int(retry_after)
+                except (TypeError, ValueError):
+                    wait_seconds = 60
+                wait_seconds = min(max(wait_seconds, 5), 300)
                 self.log(
                     f"  [!] Dòng {row_num}: Smarty trả về 429 với key {key_label}, {proxy_label}. "
-                    f"Kích hoạt dừng an toàn; không retry và không đổi proxy để tránh phát sinh thêm request."
+                    f"Tạm dừng {wait_seconds}s rồi thử lại cùng proxy (lần {attempt})."
                 )
-                outcome["_proxy_url"] = proxy_url
-                outcome["rate_limit_stop"] = True
-                return outcome
-            else:
-                cooldown = self._mark_proxy_issue(proxy_url)
-                self.log(
-                    f"  [!] Dòng {row_num}: Lỗi mạng/Timeout (lần {attempt + 1}/{max_retries}, {proxy_label}). "
-                    f"Tạm khóa proxy này ~{cooldown:.0f}s, đang thử danh tính khác..."
-                )
+                time.sleep(wait_seconds)
+                retry_identity = identity
+                continue
 
-            jitter = random.uniform(0.3, 1.3)
-            if self.proxy_list or len(self.api_key_list) > 1:
-                # Còn phương án khác (proxy khác hoặc key khác) để né -> chỉ cần chờ ngắn.
-                time.sleep(jitter)
-            else:
-                # Chỉ có đúng 1 key, không có proxy nào để đổi -> đành giãn thời gian theo cấp
-                # số nhân + jitter, chờ key tự hết cooldown.
-                sleep_for = base_wait + jitter
-                self.log(f"      Không có proxy/key nào khác khả dụng, chờ {sleep_for:.1f}s trước khi thử lại...")
-                time.sleep(sleep_for)
-                base_wait = min(base_wait * 1.8, 30)
+            self._mark_proxy_issue(proxy_url)
+            self.log(
+                f"  [!] Dòng {row_num}: Lỗi mạng/Timeout (lần {attempt}, {proxy_label}). "
+                f"Tạm dừng {network_wait}s rồi tự thử lại..."
+            )
+            time.sleep(network_wait)
+            network_wait = min(network_wait * 1.5, 60)
 
-        hint = (
-            " (Rất có thể do API Key hiện tại đã hết quota - hãy kiểm tra tài khoản Smarty hoặc bổ sung "
-            "thêm key vào 'smarty_keys.txt' để tool tự động xoay vòng.)"
-            if only_one_key else ""
-        )
-        return {
-            "result": f"Lỗi: Quá nhiều request (đã xoay vòng Proxy/User-Agent/Key nhưng vẫn bị giới hạn hoặc lỗi mạng liên tục){hint}",
-            "analysis": {},
-            "_proxy_url": proxy_url if 'proxy_url' in locals() else None,
-            "success": False,
-        }
+        return {"result": "Bị dừng", "analysis": {}, "stopped": True}
 
     # ---- Bảng mã tra cứu chính thức của Smarty (US Street API) ----
-    # Nguồn: https://www.smarty.com/docs/apis/us-street-api/reference
-
-    # dpv_footnotes: chuỗi ghép các mã 2 ký tự KHÔNG có dấu phân cách (vd "AABB", "AAC1"...)
-    # Với mỗi mã, mô tả + có chặn (block) hay không khi chạy chế độ khắt khe.
     DPV_FOOTNOTE_INFO = {
         "AA": ("Street/city/state/ZIP hợp lệ", False),
         "A1": ("Địa chỉ KHÔNG có trong dữ liệu USPS", True),
         "BB": ("Toàn bộ địa chỉ hợp lệ", False),
-        "CC": ("Thông tin phụ (Apt/Suite...) không được nhận diện, KHÔNG bắt buộc để giao hàng", True),
-        "C1": ("Thông tin phụ không được nhận diện, và BẮT BUỘC phải có để giao hàng", True),
+        "CC": ("Thông tin phụ không được nhận diện, KHÔNG bắt buộc", True),
+        "C1": ("Thông tin phụ không được nhận diện, BẮT BUỘC", True),
         "F1": ("Địa chỉ quân sự/ngoại giao", True),
-        "G1": ("Địa chỉ General Delivery (nhận tại bưu cục)", True),
-        "M1": ("Thiếu số nhà (primary number)", True),
+        "G1": ("Địa chỉ General Delivery", True),
+        "M1": ("Thiếu số nhà", True),
         "M3": ("Số nhà không hợp lệ", True),
-        "N1": ("Thiếu thông tin phụ (Apt/Suite...) BẮT BUỘC để giao hàng", True),
+        "N1": ("Thiếu thông tin phụ bắt buộc", True),
         "PB": ("Địa chỉ dạng PO Box kiểu đường phố", True),
         "P1": ("Thiếu số hộp PO/RR/HC", True),
         "P3": ("Số hộp PO/RR/HC không hợp lệ", True),
-        "RR": ("Địa chỉ xác nhận có thông tin hộp thư riêng (PMB)", True),
-        "R1": ("Địa chỉ xác nhận KHÔNG có thông tin hộp thư riêng (PMB)", False),
-        "R7": ("Địa chỉ hợp lệ nhưng KHÔNG được USPS giao hàng tận nhà", True),
-        "TA": ("Số nhà chỉ khớp được sau khi bỏ ký tự chữ cái ở cuối", True),
-        "U1": ("ZIP Code dạng 'unique' (đặc thù)", True),
+        "RR": ("Có thông tin hộp thư riêng PMB", True),
+        "R1": ("Không có thông tin hộp thư riêng PMB", False),
+        "R7": ("Không giao hàng tận nhà", True),
+        "TA": ("Khớp sau khi bỏ ký tự chữ cái cuối số nhà", True),
+        "U1": ("ZIP Code dạng unique", True),
     }
 
-    # footnotes (khác dpv_footnotes): các mã 1 ký tự, ngăn cách bởi dấu '#', vd "L#", "H#L#"
-    # Các mã thuần "thông tin", KHÔNG coi là cảnh báo (không chặn):
     FOOTNOTE_INFO_ONLY = {"N", "Q", "Y", "Z", "LL", "LI"}
     FOOTNOTE_INFO = {
-        "A": "USPS đã sửa lại ZIP Code khác với ZIP đã nhập",
-        "B": "USPS đã sửa lại chính tả tên thành phố/tiểu bang",
-        "C": "Không xác định được ZIP (thiếu/sai city+state hoặc ZIP)",
-        "D": "Địa chỉ KHÔNG có trong dữ liệu USPS (không có ZIP+4)",
-        "E": "Nhiều bản ghi cùng chung 1 ZIP Code (mơ hồ)",
-        "F": "KHÔNG tìm thấy địa chỉ như đã nhập trong thành phố/ZIP đã cho",
-        "G": "Đã dùng dữ liệu từ trường Addressee để ghép vào địa chỉ",
-        "H": "Thiếu số phụ (Apt/Suite...)",
-        "I": "Dữ liệu địa chỉ không đủ/không chính xác để xác định 1 ZIP+4 duy nhất",
-        "J": "Địa chỉ bị trùng 2 địa chỉ (dual address)",
-        "K": "Chỉ khớp được sau khi ĐỔI hướng (N/S/E/W - cardinal rule match)",
-        "L": "Một thành phần địa chỉ (suffix hoặc directional) đã bị THÊM/SỬA/XOÁ để khớp",
-        "M": "Đã sửa lại chính tả tên đường (street name)",
-        "N": "Đã chuẩn hoá viết tắt (vd STREET -> ST) - chỉ mang tính chuẩn hoá",
-        "O": "Có nhiều ZIP+4 phù hợp, đã lấy mã thấp nhất",
-        "P": "Địa chỉ có tên khác được ưu tiên hơn (better address exists)",
-        "Q": "ZIP Code dạng 'unique' - chỉ mang tính thông tin",
-        "R": "Chưa khớp được, nhưng EWS báo sẽ sớm có dữ liệu (địa chỉ mới)",
-        "S": "Thông tin phụ (Apt/Suite...) không được USPS nhận diện",
-        "T": "Trùng 'magnet street syndrome' - không đủ điều kiện trả ZIP+4 chuẩn CASS",
-        "U": "Tên thành phố không chính thức (đã đổi sang tên chuẩn USPS)",
-        "V": "KHÔNG xác thực được city/state khớp với ZIP đã cho",
-        "W": "ZIP Code này KHÔNG có giao hàng tận đường, phải dùng PO Box/General Delivery",
-        "X": "ZIP Code 'unique' dùng mã ZIP+4 mặc định - địa chỉ có thể không có thật",
-        "Y": "Địa chỉ quân sự (military match) - chỉ mang tính thông tin",
-        "Z": "Đã khớp qua ZIPMOVE (ZIP đã chuyển) - chỉ mang tính thông tin",
-        "LL": "Được đánh dấu gửi sang LACSLink - chỉ mang tính thông tin",
-        "LI": "Được đánh dấu gửi sang LACSLink - chỉ mang tính thông tin",
+        "A": "USPS đã sửa ZIP Code",
+        "B": "USPS đã sửa chính tả city/state",
+        "C": "Không xác định được ZIP",
+        "D": "Địa chỉ không có trong USPS",
+        "E": "Nhiều bản ghi cùng ZIP",
+        "F": "Không tìm thấy địa chỉ như đã nhập",
+        "G": "Đã dùng dữ liệu addressee",
+        "H": "Thiếu số phụ Apt/Suite",
+        "I": "Dữ liệu không đủ để xác định ZIP+4",
+        "J": "Có hai địa chỉ trong input",
+        "K": "Đã đổi hướng N/S/E/W để khớp",
+        "L": "Đã thêm/sửa/xóa thành phần địa chỉ",
+        "M": "Đã sửa chính tả tên đường",
+        "N": "Đã chuẩn hóa viết tắt",
+        "O": "Có nhiều ZIP+4, lấy mã thấp nhất",
+        "P": "Có tên địa chỉ ưu tiên hơn",
+        "Q": "ZIP Code dạng unique",
+        "R": "EWS báo địa chỉ sắp có dữ liệu",
+        "S": "Thông tin phụ không được nhận diện",
+        "T": "Magnet street syndrome",
+        "U": "Tên thành phố không chính thức",
+        "V": "City/state không khớp ZIP",
+        "W": "ZIP không giao hàng tận đường",
+        "X": "ZIP unique dùng ZIP+4 mặc định",
+        "Y": "Địa chỉ quân sự",
+        "Z": "Khớp qua ZIPMOVE",
+        "LL": "Được gửi sang LACSLink",
+        "LI": "Được gửi sang LACSLink",
     }
 
     def _parse_dpv_footnotes(self, raw):
