@@ -1,0 +1,221 @@
+[16:59:51] BẮT ĐẦU CHẨN ĐOÁN NGUYÊN NHÂN BỊ CHẶN
+[16:59:51] 
+=== TEST: Không proxy, không cookie, key public ===
+[16:59:51] RESULT: {
+  "status_code": 200,
+  "headers": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-origin": "https://www.smarty.com",
+    "access-control-expose-headers": "Retry-After, X-License-Name",
+    "content-type": "application/json; charset=utf-8",
+    "x-license-name": "us-rooftop-geocoding-cloud",
+    "x-request-id": "01a06bdc-44da-7e70-9c60-cb50f02b8740",
+    "date": "Fri, 04 Sep 2026 09:59:52 GMT",
+    "transfer-encoding": "chunked",
+    "vary": "Accept-Encoding",
+    "content-encoding": "gzip"
+  },
+  "body": "[{\"input_index\":0,\"candidate_index\":0,\"delivery_line_1\":\"1600 Amphitheatre Pkwy\",\"last_line\":\"Mountain View CA 94043-1351\",\"delivery_point_barcode\":\"940431351000\",\"components\":{\"primary_number\":\"1600\",\"street_name\":\"Amphitheatre\",\"street_suffix\":\"Pkwy\",\"city_name\":\"Mountain View\",\"default_city_name\":\"Mountain View\",\"state_abbreviation\":\"CA\",\"zipcode\":\"94043\",\"plus4_code\":\"1351\",\"delivery_point\":\"00\",\"delivery_point_check_digit\":\"0\"},\"metadata\":{\"record_type\":\"S\",\"zip_type\":\"Standard\",\"county_fip"
+}
+[16:59:53] 
+=== TEST: Proxy đầu tiên: http://nvmkysmm:p3zqsarlu5wd@31.59.20.176:6754 ===
+[17:00:14] EXCEPTION: HTTPSConnectionPool(host='us-street.api.smarty.com', port=443): Read timed out. (read timeout=20)
+[17:00:16] 
+=== TEST: User-Agent #0: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36... ===
+[17:00:19] RESULT: {
+  "status_code": 200,
+  "headers": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-origin": "https://www.smarty.com",
+    "access-control-expose-headers": "Retry-After, X-License-Name",
+    "content-type": "application/json; charset=utf-8",
+    "x-license-name": "us-rooftop-geocoding-cloud",
+    "x-request-id": "01a06bdc-ae63-7b5b-9f7f-00dc940a4030",
+    "date": "Fri, 04 Sep 2026 10:00:19 GMT",
+    "transfer-encoding": "chunked",
+    "vary": "Accept-Encoding",
+    "content-encoding": "gzip"
+  },
+  "body": "[{\"input_index\":0,\"candidate_index\":0,\"delivery_line_1\":\"1600 Amphitheatre Pkwy\",\"last_line\":\"Mountain View CA 94043-1351\",\"delivery_point_barcode\":\"940431351000\",\"components\":{\"primary_number\":\"1600\",\"street_name\":\"Amphitheatre\",\"street_suffix\":\"Pkwy\",\"city_name\":\"Mountain View\",\"default_city_name\":\"Mountain View\",\"state_abbreviation\":\"CA\",\"zipcode\":\"94043\",\"plus4_code\":\"1351\",\"delivery_point\":\"00\",\"delivery_point_check_digit\":\"0\"},\"metadata\":{\"record_type\":\"S\",\"zip_type\":\"Standard\",\"county_fip"
+}
+[17:00:20] 
+=== TEST: User-Agent #1: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36... ===
+[17:00:20] RESULT: {
+  "status_code": 200,
+  "headers": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-origin": "https://www.smarty.com",
+    "access-control-expose-headers": "Retry-After, X-License-Name",
+    "content-type": "application/json; charset=utf-8",
+    "x-license-name": "us-rooftop-geocoding-cloud",
+    "x-request-id": "01a06bdc-b60a-7cd1-aee2-8ea04374bf79",
+    "date": "Fri, 04 Sep 2026 10:00:21 GMT",
+    "transfer-encoding": "chunked",
+    "vary": "Accept-Encoding",
+    "content-encoding": "gzip"
+  },
+  "body": "[{\"input_index\":0,\"candidate_index\":0,\"delivery_line_1\":\"1600 Amphitheatre Pkwy\",\"last_line\":\"Mountain View CA 94043-1351\",\"delivery_point_barcode\":\"940431351000\",\"components\":{\"primary_number\":\"1600\",\"street_name\":\"Amphitheatre\",\"street_suffix\":\"Pkwy\",\"city_name\":\"Mountain View\",\"default_city_name\":\"Mountain View\",\"state_abbreviation\":\"CA\",\"zipcode\":\"94043\",\"plus4_code\":\"1351\",\"delivery_point\":\"00\",\"delivery_point_check_digit\":\"0\"},\"metadata\":{\"record_type\":\"S\",\"zip_type\":\"Standard\",\"county_fip"
+}
+[17:00:21] 
+=== TEST: User-Agent #2: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/... ===
+[17:00:22] RESULT: {
+  "status_code": 200,
+  "headers": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-origin": "https://www.smarty.com",
+    "access-control-expose-headers": "Retry-After, X-License-Name",
+    "content-type": "application/json; charset=utf-8",
+    "x-license-name": "us-rooftop-geocoding-cloud",
+    "x-request-id": "01a06bdc-bdaf-726b-bef8-a02654c17f51",
+    "date": "Fri, 04 Sep 2026 10:00:23 GMT",
+    "transfer-encoding": "chunked",
+    "vary": "Accept-Encoding",
+    "content-encoding": "gzip"
+  },
+  "body": "[{\"input_index\":0,\"candidate_index\":0,\"delivery_line_1\":\"1600 Amphitheatre Pkwy\",\"last_line\":\"Mountain View CA 94043-1351\",\"delivery_point_barcode\":\"940431351000\",\"components\":{\"primary_number\":\"1600\",\"street_name\":\"Amphitheatre\",\"street_suffix\":\"Pkwy\",\"city_name\":\"Mountain View\",\"default_city_name\":\"Mountain View\",\"state_abbreviation\":\"CA\",\"zipcode\":\"94043\",\"plus4_code\":\"1351\",\"delivery_point\":\"00\",\"delivery_point_check_digit\":\"0\"},\"metadata\":{\"record_type\":\"S\",\"zip_type\":\"Standard\",\"county_fip"
+}
+[17:00:25] SKIP: chỉ có 1 key, không thể so sánh nhiều key
+[17:00:27] 
+=== TEST: Proxy #0: http://nvmkysmm:p3zqsarlu5wd@31.59.20.176:6754 ===
+[17:00:30] RESULT: {
+  "status_code": 429,
+  "headers": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-origin": "https://www.smarty.com",
+    "access-control-expose-headers": "Retry-After, X-License-Name",
+    "x-license-name": "us-rooftop-geocoding-cloud",
+    "x-request-id": "01a06bdc-9bab-7aa5-8aea-433b484b04ec",
+    "date": "Fri, 04 Sep 2026 10:00:15 GMT",
+    "content-length": "77",
+    "content-type": "text/plain; charset=utf-8"
+  },
+  "body": "{\"errors\":[{\"id\":1588093856,\"message\":\"Too many requests key (1588093856)\"}]}"
+}
+[17:00:31] 
+=== TEST: Proxy #1: http://nvmkysmm:p3zqsarlu5wd@45.38.107.97:6014 ===
+[17:00:51] EXCEPTION: HTTPSConnectionPool(host='us-street.api.smarty.com', port=443): Read timed out. (read timeout=20)
+[17:00:52] 
+=== TEST: Proxy #2: http://nvmkysmm:p3zqsarlu5wd@198.105.121.200:6462 ===
+[17:01:13] EXCEPTION: HTTPSConnectionPool(host='us-street.api.smarty.com', port=443): Read timed out. (read timeout=20)
+[17:01:14] 
+=== TEST: Proxy #3: http://nvmkysmm:p3zqsarlu5wd@64.137.96.74:6641 ===
+[17:01:35] EXCEPTION: HTTPSConnectionPool(host='us-street.api.smarty.com', port=443): Read timed out. (read timeout=20)
+[17:01:36] 
+=== TEST: Proxy #4: http://nvmkysmm:p3zqsarlu5wd@198.23.243.226:6361 ===
+[17:01:56] EXCEPTION: HTTPSConnectionPool(host='us-street.api.smarty.com', port=443): Read timed out. (read timeout=20)
+[17:01:59] Gửi 5 request liên tiếp không delay để xem ngưỡng bị chặn
+[17:01:59] 
+=== TEST: Request liên tiếp #1 ===
+[17:02:00] RESULT: {
+  "status_code": 200,
+  "headers": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-origin": "https://www.smarty.com",
+    "access-control-expose-headers": "Retry-After, X-License-Name",
+    "content-type": "application/json; charset=utf-8",
+    "x-license-name": "us-rooftop-geocoding-cloud",
+    "x-request-id": "01a06bde-3a1e-735c-81cc-48024064c44f",
+    "date": "Fri, 04 Sep 2026 10:02:01 GMT",
+    "transfer-encoding": "chunked",
+    "vary": "Accept-Encoding",
+    "content-encoding": "gzip"
+  },
+  "body": "[{\"input_index\":0,\"candidate_index\":0,\"delivery_line_1\":\"1600 Amphitheatre Pkwy\",\"last_line\":\"Mountain View CA 94043-1351\",\"delivery_point_barcode\":\"940431351000\",\"components\":{\"primary_number\":\"1600\",\"street_name\":\"Amphitheatre\",\"street_suffix\":\"Pkwy\",\"city_name\":\"Mountain View\",\"default_city_name\":\"Mountain View\",\"state_abbreviation\":\"CA\",\"zipcode\":\"94043\",\"plus4_code\":\"1351\",\"delivery_point\":\"00\",\"delivery_point_check_digit\":\"0\"},\"metadata\":{\"record_type\":\"S\",\"zip_type\":\"Standard\",\"county_fip"
+}
+[17:02:00] 
+=== TEST: Request liên tiếp #2 ===
+[17:02:01] RESULT: {
+  "status_code": 200,
+  "headers": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-origin": "https://www.smarty.com",
+    "access-control-expose-headers": "Retry-After, X-License-Name",
+    "content-type": "application/json; charset=utf-8",
+    "x-license-name": "us-rooftop-geocoding-cloud",
+    "x-request-id": "01a06bde-3f31-774a-aef4-c13ea8f0113a",
+    "date": "Fri, 04 Sep 2026 10:02:02 GMT",
+    "transfer-encoding": "chunked",
+    "vary": "Accept-Encoding",
+    "content-encoding": "gzip"
+  },
+  "body": "[{\"input_index\":0,\"candidate_index\":0,\"delivery_line_1\":\"1600 Amphitheatre Pkwy\",\"last_line\":\"Mountain View CA 94043-1351\",\"delivery_point_barcode\":\"940431351000\",\"components\":{\"primary_number\":\"1600\",\"street_name\":\"Amphitheatre\",\"street_suffix\":\"Pkwy\",\"city_name\":\"Mountain View\",\"default_city_name\":\"Mountain View\",\"state_abbreviation\":\"CA\",\"zipcode\":\"94043\",\"plus4_code\":\"1351\",\"delivery_point\":\"00\",\"delivery_point_check_digit\":\"0\"},\"metadata\":{\"record_type\":\"S\",\"zip_type\":\"Standard\",\"county_fip"
+}
+[17:02:02] 
+=== TEST: Request liên tiếp #3 ===
+[17:02:03] RESULT: {
+  "status_code": 200,
+  "headers": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-origin": "https://www.smarty.com",
+    "access-control-expose-headers": "Retry-After, X-License-Name",
+    "content-type": "application/json; charset=utf-8",
+    "x-license-name": "us-rooftop-geocoding-cloud",
+    "x-request-id": "01a06bde-44f4-7ff4-9ec3-416f69e9763a",
+    "date": "Fri, 04 Sep 2026 10:02:03 GMT",
+    "transfer-encoding": "chunked",
+    "vary": "Accept-Encoding",
+    "content-encoding": "gzip"
+  },
+  "body": "[{\"input_index\":0,\"candidate_index\":0,\"delivery_line_1\":\"1600 Amphitheatre Pkwy\",\"last_line\":\"Mountain View CA 94043-1351\",\"delivery_point_barcode\":\"940431351000\",\"components\":{\"primary_number\":\"1600\",\"street_name\":\"Amphitheatre\",\"street_suffix\":\"Pkwy\",\"city_name\":\"Mountain View\",\"default_city_name\":\"Mountain View\",\"state_abbreviation\":\"CA\",\"zipcode\":\"94043\",\"plus4_code\":\"1351\",\"delivery_point\":\"00\",\"delivery_point_check_digit\":\"0\"},\"metadata\":{\"record_type\":\"S\",\"zip_type\":\"Standard\",\"county_fip"
+}
+[17:02:03] 
+=== TEST: Request liên tiếp #4 ===
+[17:02:04] RESULT: {
+  "status_code": 200,
+  "headers": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-origin": "https://www.smarty.com",
+    "access-control-expose-headers": "Retry-After, X-License-Name",
+    "content-type": "application/json; charset=utf-8",
+    "x-license-name": "us-rooftop-geocoding-cloud",
+    "x-request-id": "01a06bde-4a84-75aa-acac-4c208d96770f",
+    "date": "Fri, 04 Sep 2026 10:02:05 GMT",
+    "transfer-encoding": "chunked",
+    "vary": "Accept-Encoding",
+    "content-encoding": "gzip"
+  },
+  "body": "[{\"input_index\":0,\"candidate_index\":0,\"delivery_line_1\":\"1600 Amphitheatre Pkwy\",\"last_line\":\"Mountain View CA 94043-1351\",\"delivery_point_barcode\":\"940431351000\",\"components\":{\"primary_number\":\"1600\",\"street_name\":\"Amphitheatre\",\"street_suffix\":\"Pkwy\",\"city_name\":\"Mountain View\",\"default_city_name\":\"Mountain View\",\"state_abbreviation\":\"CA\",\"zipcode\":\"94043\",\"plus4_code\":\"1351\",\"delivery_point\":\"00\",\"delivery_point_check_digit\":\"0\"},\"metadata\":{\"record_type\":\"S\",\"zip_type\":\"Standard\",\"county_fip"
+}
+[17:02:05] 
+=== TEST: Request liên tiếp #5 ===
+[17:02:05] RESULT: {
+  "status_code": 200,
+  "headers": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-origin": "https://www.smarty.com",
+    "access-control-expose-headers": "Retry-After, X-License-Name",
+    "content-type": "application/json; charset=utf-8",
+    "x-license-name": "us-rooftop-geocoding-cloud",
+    "x-request-id": "01a06bde-502a-7d09-aa75-ace346473155",
+    "date": "Fri, 04 Sep 2026 10:02:06 GMT",
+    "transfer-encoding": "chunked",
+    "vary": "Accept-Encoding",
+    "content-encoding": "gzip"
+  },
+  "body": "[{\"input_index\":0,\"candidate_index\":0,\"delivery_line_1\":\"1600 Amphitheatre Pkwy\",\"last_line\":\"Mountain View CA 94043-1351\",\"delivery_point_barcode\":\"940431351000\",\"components\":{\"primary_number\":\"1600\",\"street_name\":\"Amphitheatre\",\"street_suffix\":\"Pkwy\",\"city_name\":\"Mountain View\",\"default_city_name\":\"Mountain View\",\"state_abbreviation\":\"CA\",\"zipcode\":\"94043\",\"plus4_code\":\"1351\",\"delivery_point\":\"00\",\"delivery_point_check_digit\":\"0\"},\"metadata\":{\"record_type\":\"S\",\"zip_type\":\"Standard\",\"county_fip"
+}
+[17:03:06] 
+=== TEST: Có cookie trình duyệt ===
+[17:03:07] RESULT: {
+  "status_code": 200,
+  "headers": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-origin": "https://www.smarty.com",
+    "access-control-expose-headers": "Retry-After, X-License-Name",
+    "content-type": "application/json; charset=utf-8",
+    "x-license-name": "us-rooftop-geocoding-cloud",
+    "x-request-id": "01a06bdf-3fb6-7142-adad-8e08a7956f4b",
+    "date": "Fri, 04 Sep 2026 10:03:08 GMT",
+    "transfer-encoding": "chunked",
+    "vary": "Accept-Encoding",
+    "content-encoding": "gzip"
+  },
+  "body": "[{\"input_index\":0,\"candidate_index\":0,\"delivery_line_1\":\"1600 Amphitheatre Pkwy\",\"last_line\":\"Mountain View CA 94043-1351\",\"delivery_point_barcode\":\"940431351000\",\"components\":{\"primary_number\":\"1600\",\"street_name\":\"Amphitheatre\",\"street_suffix\":\"Pkwy\",\"city_name\":\"Mountain View\",\"default_city_name\":\"Mountain View\",\"state_abbreviation\":\"CA\",\"zipcode\":\"94043\",\"plus4_code\":\"1351\",\"delivery_point\":\"00\",\"delivery_point_check_digit\":\"0\"},\"metadata\":{\"record_type\":\"S\",\"zip_type\":\"Standard\",\"county_fip"
+}
+[17:03:07] 
+=== KẾT LUẬN TỪ LOG TRÊN ===
+[17:03:07] - Nếu status 200 từ test đầu: key public hoạt động, vấn đề do tần suất/proxy.
+[17:03:07] - Nếu status 429 từ test đầu nhưng 200 khi có cookie: tool cần cookie trình duyệt.
+[17:03:07] - Nếu 429 ở mọi test: key public đã hết hạn hoặc Smarty khóa IP máy chạy.
+[17:03:07] - Nếu 429 khi có proxy nhưng 200 khi không proxy: proxy đó đã bị Smarty chặn.
+[17:03:07] - Nếu 429 ở request thứ 3-5 trong test liên tiếp: giới hạn theo tần suất request.

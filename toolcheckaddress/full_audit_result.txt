@@ -1,0 +1,44 @@
+[17:12:41] BẮT ĐẦU AUDIT TOÀN DIỆN TRƯỚC KHI ĐƯA RA ĐIỂM CẦN CẢI THIỆN
+[17:12:41] 
+=== KIỂM TRA TOÀN BỘ PROXY POOL ===
+[17:12:41] KHÔNG CÓ PROXY NÀO. Đây là trạng thái TỐT NHẤT để tránh bị quét.
+[17:12:42] 
+=== KIỂM TRA DANH SÁCH API KEY ===
+[17:12:42] Chỉ có 1 key public mặc định. Không thể xoay vòng key.
+[17:12:42] Key public vẫn 200 khi đi IP sạch, nên không cần thay key ngay.
+[17:12:43] 
+=== KIỂM TRA HEADER TRÌNH DUYỆT THẬT ===
+[17:12:43] Đầy đủ header trình duyệt thật.
+[17:12:43] So sánh header tool cũ vs header thật:
+[17:12:43]   Header tool cũ chỉ có: ['Referer', 'Origin', 'User-Agent', 'Accept-Language']
+[17:12:43]   Thiếu các header bảo mật như sec-ch-ua, sec-fetch-* sẽ khiến request dễ bị gắn cờ bot.
+[17:12:44] 
+=== KIỂM TRA COOKIE ===
+[17:12:44] KHÔNG CÓ COOKIE. Vẫn có thể 200 nếu IP sạch và tần suất thấp.
+[17:12:44] Cookie không bắt buộc, nhưng có cookie trình duyệt thật sẽ giúp giả mạo giống người hơn.
+[17:12:45] 
+=== KIỂM TRA TẦN SUẤT REQUEST ===
+[17:12:45] Gửi 6 request liên tiếp không delay, mỗi request 1 lần để tìm ngưỡng bị chặn:
+[17:12:47]   Request #1: HTTP 200
+[17:12:49]   Request #2: HTTP 429
+[17:12:49] Bị chặn sau 2 request. Cần tăng delay lên tối thiểu 6 giây giữa các request.
+[17:12:50] 
+=== KIỂM TRA AGENT VÀ LICENSE ===
+[17:12:50] Trình duyệt thật dùng:
+[17:12:50]   agent = smarty (website:demo/single-address@latest)
+[17:12:50]   license = us-core-cloud
+[17:12:50] Tool cũ dùng:
+[17:12:50]   agent = smarty (website:demo)
+[17:12:50]   license = us-rooftop-geocoding-cloud
+[17:12:50] Sự khác biệt này có thể khiến Smarty phân loại request từ tool khác với web thật.
+[17:12:50] KHUYẾN NGHỊ: Sửa agent và license trong tool chính cho giống hệt trình duyệt.
+[17:12:50] 
+=== ĐIỂM CẦN CẢI THIỆN ĐỂ TRÁNH BỊ QUÉT ===
+[17:12:50] 1. BỎ proxy xấu/bị chặn hoặc bỏ proxy hoàn toàn.
+[17:12:50] 2. Dùng agent và license giống hệt trình duyệt thật.
+[17:12:50] 3. Thêm đầy đủ header sec-ch-ua, sec-fetch-* vào mọi request.
+[17:12:50] 4. Dùng cookie trình duyệt thật và không xóa cookie sau mỗi request.
+[17:12:50] 5. Giữ delay 3-5 giây giữa các request, không retry liên tục khi dính 429.
+[17:12:50] 6. Không xoay vòng User-Agent quá nhanh, giữ cố định một User-Agent cho cả phiên.
+[17:12:50] 7. Nếu vẫn bị quét, chuyển sang Selenium/Playwright mở trình duyệt thật.
+[17:12:50] 8. Chạy bằng IP nhà sạch thay vì proxy datacenter bẩn.
