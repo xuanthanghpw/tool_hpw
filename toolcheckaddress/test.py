@@ -28,6 +28,7 @@ MIN_SMARTY_REQUEST_INTERVAL = 10.0
 STABLE_USER_AGENT = "smarty-address-tool/1.0"
 MAX_SMARTY_BACKOFF_SECONDS = 300
 MAX_RATE_LIMIT_RETRIES = 1
+RATE_LIMIT_ROUTE_WAIT_SECONDS = 10
 
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
@@ -53,6 +54,8 @@ GEMINI_FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.5
 # tra lại mới hoàn tất, để luôn phản ánh phiên GẦN NHẤT.
 SESSION_STATE_FILE = "smarty_last_session.json"
 ADDRESS_CACHE_FILE = "smarty_address_cache.json"
+PROXY_STATE_FILE = "proxy_state.json"
+PROXY_RATE_LIMIT_COOLDOWN_SECONDS = 24 * 60 * 60
 
 class SmartyApp:
     def __init__(self, root):
@@ -73,6 +76,7 @@ class SmartyApp:
         self._smarty_rate_limit_streak = 0
         self.gemini_client = None
         self.proxy_list = self._load_proxies()
+        self.proxy_status, self._proxy_rr_counter = self._load_proxy_state()
         self.api_key_list = self._load_api_keys()
         self._identity_counter = 0
 
@@ -83,9 +87,7 @@ class SmartyApp:
         # đã hết thời gian "khóa tạm" (cooldown). Mỗi mục có dạng:
         #   {"blocked_until": <timestamp thời điểm hết bị khóa>, "fail_streak": <số lần bị liên tiếp>}
         self.key_status = {}
-        self.proxy_status = {}
         self._key_rr_counter = 0
-        self._proxy_rr_counter = 0
         # Chỉ cảnh báo 1 lần/phiên chạy (không spam log) khi phát hiện dấu hiệu API Key duy
         # nhất có thể đã hết quota (bị 429 liên tục nhiều lần dù đã đổi proxy/User-Agent).
         self._warned_single_key_session = False
@@ -114,6 +116,47 @@ class SmartyApp:
             if keys:
                 return keys
         return [DEFAULT_SMARTY_KEY]
+
+    def _proxy_state_path(self):
+        return os.path.join(self.session_state_dir, PROXY_STATE_FILE)
+
+    def _load_proxy_state(self):
+        path = self._proxy_state_path()
+        if not os.path.exists(path):
+            return {}, 0
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return {}, 0
+            states = payload.get("proxies", {})
+            if not isinstance(states, dict):
+                states = {}
+            next_index = payload.get("next_index", 0)
+            try:
+                next_index = int(next_index)
+            except (TypeError, ValueError):
+                next_index = 0
+            return {
+                proxy: status
+                for proxy, status in states.items()
+                if proxy in self.proxy_list and isinstance(status, dict)
+            }, next_index
+        except (OSError, json.JSONDecodeError):
+            return {}, 0
+
+    def _save_proxy_state(self):
+        path = self._proxy_state_path()
+        try:
+            payload = {
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "next_index": self._proxy_rr_counter,
+                "proxies": self.proxy_status,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            self.log(f"    [!] Không lưu được trạng thái proxy: {e}")
 
     def _migrate_legacy_data_files(self):
         for filename in (
@@ -149,9 +192,14 @@ class SmartyApp:
         if available:
             chosen = available[counter % len(available)]
             setattr(self, counter_attr, counter + 1)
+            if counter_attr == "_proxy_rr_counter":
+                self._save_proxy_state()
             return chosen
         # Không còn phần tử nào rảnh -> chọn phần tử hết cooldown sớm nhất, thay vì random.
-        return min(values, key=lambda v: status_dict.get(v, {}).get("blocked_until", 0))
+        chosen = min(values, key=lambda v: status_dict.get(v, {}).get("blocked_until", 0))
+        if counter_attr == "_proxy_rr_counter":
+            self._save_proxy_state()
+        return chosen
 
     def _mark_key_rate_limited(self, key):
         """Đánh dấu 1 API Key vừa bị Smarty trả về 429 (rate limit). Khóa tạm key này lại
@@ -180,7 +228,17 @@ class SmartyApp:
         st["fail_streak"] += 1
         cooldown = min(3 * (2 ** (st["fail_streak"] - 1)), 120)
         st["blocked_until"] = time.time() + cooldown
+        self._save_proxy_state()
         return cooldown
+
+    def _mark_proxy_rate_limited(self, proxy_url):
+        if not proxy_url:
+            return
+        st = self.proxy_status.setdefault(proxy_url, {"blocked_until": 0.0, "fail_streak": 0})
+        st["fail_streak"] += 1
+        st["blocked_until"] = time.time() + PROXY_RATE_LIMIT_COOLDOWN_SECONDS
+        self._save_proxy_state()
+        return PROXY_RATE_LIMIT_COOLDOWN_SECONDS
 
     def _mark_proxy_success(self, proxy_url):
         if not proxy_url:
@@ -188,6 +246,7 @@ class SmartyApp:
         st = self.proxy_status.setdefault(proxy_url, {"blocked_until": 0.0, "fail_streak": 0})
         st["fail_streak"] = 0
         st["blocked_until"] = 0.0
+        self._save_proxy_state()
 
     def _mask_key(self, key):
         """Che bớt API Key khi in ra log (chỉ hiện 4 ký tự cuối), tránh lộ trọn key ra màn
@@ -695,9 +754,7 @@ class SmartyApp:
         # Bắt đầu 1 phiên gọi Smarty mới -> reset lại trạng thái xoay vòng key/proxy (cooldown)
         # về sạch, vì người dùng có thể đã bổ sung thêm key mới/đợi qua giới hạn từ lần trước.
         self.key_status = {}
-        self.proxy_status = {}
         self._key_rr_counter = 0
-        self._proxy_rr_counter = 0
         self._warned_single_key_session = False
         self._smarty_backoff_until = 0.0
         self._smarty_rate_limit_streak = 0
@@ -1653,33 +1710,41 @@ Danh sách đầu vào (JSON):
             }
 
     def call_smarty_api_with_retry(self, street_input, max_retries, row_num):
-        # Chỉ trả về khi Smarty phản hồi HTTP 200 hoặc người dùng bấm Dừng. Các lỗi
-        # tạm thời không được phép lọt vào collected_data và xuất hiện trong Excel.
         network_wait = 5
         attempt = 0
-        rate_limit_retries = 0
+        attempted_routes = set()
         retry_identity = None
+
+        def route_key(proxy_url):
+            return proxy_url or "__direct_ip__"
+
+        def next_identity():
+            routes = [proxy for proxy in self.proxy_list if route_key(proxy) not in attempted_routes]
+            if "__direct_ip__" not in attempted_routes:
+                routes.append(None)
+            if not routes:
+                return None
+            identity = self._next_identity()
+            identity["proxy_url"] = routes[0]
+            return identity
+
         while not self.stop_requested:
             attempt += 1
-            if self.stop_requested:
-                return {"result": "Bị dừng", "analysis": {}, "stopped": True}
-
-            # Mỗi LƯỢT GỌI (kể cả lần đầu, không chỉ khi bị chặn) đều dùng 1 danh tính mới:
-            # proxy khác + Smarty key khác (nếu có) + User-Agent/Accept-Language khác. Việc
-            # chọn key/proxy giờ LINH ĐỘNG (xem _next_identity/_pick_available): tự động né
-            # những key/proxy vừa bị 429/lỗi mạng thay vì cứ lặp lại mù quáng.
-            identity = retry_identity or self._next_identity()
+            identity = retry_identity or next_identity()
+            if identity is None:
+                return {
+                    "result": "Bị dừng: đã thử hết proxy và IP thật nhưng Smarty vẫn không phản hồi thành công",
+                    "analysis": {},
+                    "stopped": True,
+                    "rate_limit_exhausted": True,
+                }
             retry_identity = None
             api_key = identity["api_key"]
             proxy_url = identity.get("proxy_url")
+            attempted_routes.add(route_key(proxy_url))
             outcome = self.call_smarty_api(street_input, identity)
 
-            is_rate_limited = outcome.get("rate_limited")
-            is_network_error = outcome.get("network_error")
-
-            if not is_rate_limited and not is_network_error:
-                # Gọi được (dù thành công hay lỗi khác không liên quan rate-limit/mạng) -> key
-                # và proxy này vẫn "khỏe", xóa cờ nghi ngờ để lần sau lại được ưu tiên chọn.
+            if not outcome.get("rate_limited") and not outcome.get("network_error"):
                 self._mark_key_success(api_key)
                 self._mark_proxy_success(proxy_url)
                 outcome["_proxy_url"] = proxy_url
@@ -1687,39 +1752,31 @@ Danh sách đầu vào (JSON):
 
             key_label = self._mask_key(api_key)
             proxy_label = self._proxy_label(proxy_url)
-
-            if is_rate_limited:
-                if rate_limit_retries >= MAX_RATE_LIMIT_RETRIES:
-                    self.log(
-                        f"  [DỪNG] Dòng {row_num}: Smarty vẫn trả 429 sau "
-                        f"{MAX_RATE_LIMIT_RETRIES} lần thử lại; bỏ qua việc chờ lặp thêm."
-                    )
-                    outcome["_proxy_url"] = proxy_url
-                    outcome["rate_limit_exhausted"] = True
-                    outcome["stopped"] = True
-                    return outcome
-
-                rate_limit_retries += 1
+            if outcome.get("rate_limited"):
+                self._mark_proxy_rate_limited(proxy_url)
                 retry_after = outcome.get("retry_after", "")
                 try:
-                    wait_seconds = int(retry_after)
+                    server_wait = int(retry_after)
                 except (TypeError, ValueError):
-                    wait_seconds = 60
-                wait_seconds = min(max(wait_seconds, 5), 300)
+                    server_wait = 0
+                wait_seconds = min(max(server_wait, RATE_LIMIT_ROUTE_WAIT_SECONDS), 30)
                 self.log(
                     f"  [!] Dòng {row_num}: Smarty trả về 429 với key {key_label}, {proxy_label}. "
-                    f"Tạm dừng {wait_seconds}s rồi thử lại cùng proxy (lần {attempt})."
+                    f"Bỏ qua tuyến này; chờ {wait_seconds}s rồi thử tuyến tiếp theo."
                 )
                 time.sleep(wait_seconds)
-                retry_identity = identity
+                retry_identity = next_identity()
+                if retry_identity and retry_identity.get("proxy_url") is None:
+                    self.log(f"  [FALLBACK] Dòng {row_num}: chuyển sang IP thật.")
                 continue
 
             self._mark_proxy_issue(proxy_url)
             self.log(
                 f"  [!] Dòng {row_num}: Lỗi mạng/Timeout (lần {attempt}, {proxy_label}). "
-                f"Tạm dừng {network_wait}s rồi tự thử lại..."
+                f"Tạm dừng {network_wait}s rồi thử tuyến tiếp theo..."
             )
             time.sleep(network_wait)
+            retry_identity = next_identity()
             network_wait = min(network_wait * 1.5, 60)
 
         return {"result": "Bị dừng", "analysis": {}, "stopped": True}
