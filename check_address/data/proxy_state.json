@@ -1,18 +1,22 @@
 {
-  "updated_at": "2026-09-05 02:35:49",
-  "next_index": 37,
+  "updated_at": "2026-09-05 09:25:45",
+  "next_index": 29,
   "proxies": {
     "http://nvmkysmm:p3zqsarlu5wd@31.59.20.176:6754": {
-      "blocked_until": 1788636683.538106,
-      "fail_streak": 1
+      "blocked_until": 1788578005.792918,
+      "fail_streak": 5
     },
     "http://nvmkysmm:p3zqsarlu5wd@45.38.107.97:6014": {
-      "blocked_until": 1788636333.1329646,
-      "fail_streak": 1
+      "blocked_until": 0.0,
+      "fail_streak": 0
     },
     "http://nvmkysmm:p3zqsarlu5wd@198.105.121.200:6462": {
-      "blocked_until": 1788635722.364097,
-      "fail_streak": 2
+      "blocked_until": 0.0,
+      "fail_streak": 0
+    },
+    "http://nvmkysmm:p3zqsarlu5wd@64.137.96.74:6641": {
+      "blocked_until": 0.0,
+      "fail_streak": 0
     },
     "http://nvmkysmm:p3zqsarlu5wd@198.23.243.226:6361": {
       "blocked_until": 0.0,
@@ -27,8 +31,8 @@
       "fail_streak": 0
     },
     "http://nvmkysmm:p3zqsarlu5wd@142.111.67.146:5611": {
-      "blocked_until": 1788636949.857468,
-      "fail_streak": 1
+      "blocked_until": 0.0,
+      "fail_streak": 0
     },
     "http://nvmkysmm:p3zqsarlu5wd@191.96.254.138:6185": {
       "blocked_until": 0.0,
@@ -39,12 +43,12 @@
       "fail_streak": 0
     },
     "http://kgaueuql:tq7zfpc19llo@31.59.20.176:6754": {
-      "blocked_until": 0.0,
-      "fail_streak": 0
+      "blocked_until": 1788573999.8020916,
+      "fail_streak": 1
     },
     "http://kgaueuql:tq7zfpc19llo@45.38.107.97:6014": {
-      "blocked_until": 1788636477.8514469,
-      "fail_streak": 1
+      "blocked_until": 0.0,
+      "fail_streak": 0
     },
     "http://kgaueuql:tq7zfpc19llo@198.105.121.200:6462": {
       "blocked_until": 0.0,
@@ -75,6 +79,46 @@
       "fail_streak": 0
     },
     "http://kgaueuql:tq7zfpc19llo@31.58.9.4:6077": {
+      "blocked_until": 0.0,
+      "fail_streak": 0
+    },
+    "http://dqartjhd:p2w67ldtqdka@31.59.20.176:6754": {
+      "blocked_until": 1788574194.8082526,
+      "fail_streak": 1
+    },
+    "http://dqartjhd:p2w67ldtqdka@45.38.107.97:6014": {
+      "blocked_until": 0.0,
+      "fail_streak": 0
+    },
+    "http://dqartjhd:p2w67ldtqdka@198.105.121.200:6462": {
+      "blocked_until": 0.0,
+      "fail_streak": 0
+    },
+    "http://dqartjhd:p2w67ldtqdka@64.137.96.74:6641": {
+      "blocked_until": 0.0,
+      "fail_streak": 0
+    },
+    "http://dqartjhd:p2w67ldtqdka@198.23.243.226:6361": {
+      "blocked_until": 0.0,
+      "fail_streak": 0
+    },
+    "http://dqartjhd:p2w67ldtqdka@38.154.185.97:6370": {
+      "blocked_until": 0.0,
+      "fail_streak": 0
+    },
+    "http://dqartjhd:p2w67ldtqdka@84.247.60.125:6095": {
+      "blocked_until": 0.0,
+      "fail_streak": 0
+    },
+    "http://dqartjhd:p2w67ldtqdka@142.111.67.146:5611": {
+      "blocked_until": 0.0,
+      "fail_streak": 0
+    },
+    "http://dqartjhd:p2w67ldtqdka@191.96.254.138:6185": {
+      "blocked_until": 0.0,
+      "fail_streak": 0
+    },
+    "http://dqartjhd:p2w67ldtqdka@31.58.9.4:6077": {
       "blocked_until": 0.0,
       "fail_streak": 0
     }
