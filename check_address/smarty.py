@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 import requests
 import json
 import re
@@ -17,16 +17,19 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 from openpyxl.styles import PatternFill, Font
 
-try:
-    from google import genai
-    from google.genai import types as genai_types
-    HAS_GEMINI = True
-except ImportError:
-    HAS_GEMINI = False
-
 API_URL = "https://us-street.api.smarty.com/street-address"
 DEFAULT_SMARTY_KEY = "21102174564513388"
+DEFAULT_LICENSE_VALUE = ""
 MIN_SMARTY_REQUEST_INTERVAL = 10.0
+# Khi dùng tài khoản PRO (License Unlimited lookups/sec), không cần giãn cách nhân tạo giữa
+# các request nữa - đây là điểm khác biệt cốt lõi so với chế độ "Chưa có tài khoản" (vốn phải
+# xoay vòng Proxy/Key + giãn cách MIN_SMARTY_REQUEST_INTERVAL để né 429 vì dùng chung hạn mức
+# theo IP/key miễn phí).
+PRO_MIN_SMARTY_REQUEST_INTERVAL = 0.0
+PRO_MAX_WORKER_COUNT = 20
+PRO_DEFAULT_WORKER_COUNT = 5
+PRO_MAX_RETRIES = 5
+PRO_RATE_LIMIT_WAIT_SECONDS = 5
 STABLE_USER_AGENT = "smarty-address-tool/1.0"
 MAX_SMARTY_BACKOFF_SECONDS = 300
 MAX_RATE_LIMIT_RETRIES = 1
@@ -41,14 +44,6 @@ except OSError:
     DATA_DIR = os.path.join(os.getenv("LOCALAPPDATA", APP_DIR), "SmartyAddressTool", "data")
     os.makedirs(DATA_DIR, exist_ok=True)
 
-GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-OPENROUTER_MODELS = [
-    "meta-llama/llama-3.1-8b-instruct:free",
-    "google/gemini-2.0-flash-exp:free",
-    "mistralai/mistral-7b-instruct:free",
-]
-GEMINI_FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash']
-
 # File lưu lại PHIÊN LÀM VIỆC GẦN NHẤT (toàn bộ collected_data - tức là các dòng đã gọi
 # xong API Smarty, KÈM trạng thái/lý do AI đã chấm gần nhất nếu có). Nhờ vậy, dù đã đóng
 # hẳn cửa sổ 1 lần chạy xong, người dùng vẫn có thể mở lại tool và bấm "Kiểm tra lại" để
@@ -61,11 +56,13 @@ PROXY_STATE_FILE = "proxy_state.json"
 PROXY_RATE_LIMIT_BASE_COOLDOWN_SECONDS = 5 * 60
 PROXY_RATE_LIMIT_MAX_COOLDOWN_SECONDS = 2 * 60 * 60
 CHECKPOINT_INTERVAL = 25
+AI_PROMPT_FILE_THRESHOLD_CHARS = 180000
+AI_MAX_COMPLETION_ROUNDS = 6
 
 class SmartyApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Smarty API & Google Gemini Auto Check (Xoay vòng Proxy)")
+        self.root.title("Smarty API & Grok + DeepSeek Auto Check (Xoay vòng Proxy)")
         self.root.geometry("820x780")
 
         self.excel_path = ""
@@ -77,6 +74,8 @@ class SmartyApp:
         self._proxy_selection_lock = threading.RLock()
         self._request_rate_lock = threading.Lock()
         self._thread_local = threading.local()
+        # Chỉ tự mở Grok và DeepSeek một lần trong suốt vòng đời ứng dụng.
+        self._ai_browsers_opened = False
 
         self.session_state_dir = DATA_DIR
         self._migrate_legacy_data_files()
@@ -85,7 +84,12 @@ class SmartyApp:
         self._last_smarty_request_at = 0.0
         self._smarty_backoff_until = 0.0
         self._smarty_rate_limit_streak = 0
-        self.gemini_client = None
+        # Khoảng cách tối thiểu giữa các request Smarty THỰC TẾ được áp dụng trong
+        # call_smarty_api(). Mặc định bằng hằng số MIN_SMARTY_REQUEST_INTERVAL (chế độ Chưa
+        # có tài khoản Pro). Khi người dùng chuyển sang tab "Đã có tài khoản Pro", giá trị này
+        # được đổi thành PRO_MIN_SMARTY_REQUEST_INTERVAL (mặc định 0 - không giãn cách) ngay
+        # trước khi bắt đầu xử lý, vì gói Pro có rate limit Unlimited lookups/sec.
+        self._min_smarty_interval = MIN_SMARTY_REQUEST_INTERVAL
         self.proxy_list = self._load_proxies()
         self.proxy_status, self._proxy_rr_counter = self._load_proxy_state()
         self.api_key_list = self._load_api_keys()
@@ -403,8 +407,22 @@ class SmartyApp:
         self.lbl_excel_path = tk.Label(frame_top, text="Chưa chọn file...", fg="gray")
         self.lbl_excel_path.pack(side="left")
 
-        frame_delay = tk.Frame(self.root)
-        frame_delay.pack(pady=5, padx=10, fill="x")
+        frame_conn = tk.LabelFrame(self.root, text=" Chế độ kết nối Smarty ", font=("Arial", 10, "bold"), fg="#0078D7")
+        frame_conn.pack(pady=10, padx=10, fill="x")
+
+        # Biến theo dõi tab đang chọn: "free" (chưa có tài khoản Pro - xoay vòng Proxy/Key
+        # như cũ) hoặc "pro" (đã có tài khoản Pro - dùng thẳng 1 key Pro, KHÔNG xoay proxy).
+        self.connection_mode_var = tk.StringVar(value="free")
+
+        self.connection_notebook = ttk.Notebook(frame_conn)
+        self.connection_notebook.pack(fill="x", padx=8, pady=8)
+
+        # ---------- TAB 1: CHƯA CÓ TÀI KHOẢN PRO (logic cũ - giữ nguyên) ----------
+        tab_free = tk.Frame(self.connection_notebook)
+        self.connection_notebook.add(tab_free, text="Chưa có tài khoản Pro (xoay vòng Proxy)")
+
+        frame_delay = tk.Frame(tab_free)
+        frame_delay.pack(pady=5, padx=10, fill="x", anchor="w")
 
         lbl_delay = tk.Label(frame_delay, text="Độ trễ API Smarty (giây):", font=("Arial", 10, "bold"))
         lbl_delay.pack(side="left")
@@ -419,6 +437,81 @@ class SmartyApp:
         self.worker_menu.config(width=5)
         self.worker_menu.pack(side="left")
         self._refresh_worker_menu()
+
+        tk.Label(
+            tab_free,
+            text="* Tool tự nạp Proxy (data/proxies.txt) và Key Smarty (data/smarty_keys.txt) nếu có, rồi TỰ ĐỘNG\n"
+                 "  xoay vòng + né các key/proxy vừa bị 429 để hạn chế lỗi giới hạn request của tài khoản miễn phí.",
+            fg="gray", font=("Arial", 8), justify="left", anchor="w"
+        ).pack(anchor="w", padx=10, pady=(0, 8))
+
+        # ---------- TAB 2: ĐÃ CÓ TÀI KHOẢN PRO (mới) ----------
+        tab_pro = tk.Frame(self.connection_notebook)
+        self.connection_notebook.add(tab_pro, text="Đã có tài khoản Pro (Unlimited)")
+
+        frame_pro_key = tk.Frame(tab_pro)
+        frame_pro_key.pack(pady=(8, 2), padx=10, fill="x", anchor="w")
+
+        tk.Label(frame_pro_key, text="Smarty Auth ID:", width=22, anchor="w", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="w", pady=2)
+        self.pro_auth_id_var = tk.StringVar(value="")
+        self.entry_pro_auth_id = tk.Entry(frame_pro_key, textvariable=self.pro_auth_id_var, width=40, font=("Consolas", 10), show="*")
+        self.entry_pro_auth_id.grid(row=0, column=1, padx=5, pady=2, sticky="w")
+
+        tk.Label(frame_pro_key, text="Smarty Auth Token:", width=22, anchor="w", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="w", pady=2)
+        self.pro_auth_token_var = tk.StringVar(value="")
+        self.entry_pro_auth_token = tk.Entry(frame_pro_key, textvariable=self.pro_auth_token_var, width=40, font=("Consolas", 10), show="*")
+        self.entry_pro_auth_token.grid(row=1, column=1, padx=5, pady=2, sticky="w")
+
+        tk.Label(frame_pro_key, text="License value:", width=22, anchor="w", font=("Arial", 10, "bold")).grid(row=2, column=0, sticky="w", pady=2)
+        self.pro_license_var = tk.StringVar(value=DEFAULT_LICENSE_VALUE)
+        self.entry_pro_license = tk.Entry(frame_pro_key, textvariable=self.pro_license_var, width=40, font=("Consolas", 10))
+        self.entry_pro_license.grid(row=2, column=1, padx=5, pady=2, sticky="w")
+
+        tk.Label(
+            tab_pro,
+            text=("* Đây là cặp \"Secret Key\" (Auth ID + Auth Token) - KHÁC với \"Embedded key\" (1 key duy nhất, bị giới hạn "
+                  "theo domain website) mà tab bên cạnh đang dùng. Lấy tại: đăng nhập smarty.com -> Account -> API Keys -> "
+                  "tab \"Secret Keys\" -> bấm \"+ Generate secret key\" nếu chưa có -> copy Auth ID và Auth Token hiện ra "
+                  "(Auth Token chỉ hiển thị 1 lần, nhớ lưu lại). Secret Key không bị giới hạn theo domain nên phù hợp để "
+                  "gọi từ tool chạy trên máy tính như thế này."),
+            fg="gray", font=("Arial", 8), justify="left", wraplength=760
+        ).pack(anchor="w", padx=10, pady=(2, 4))
+
+        frame_pro_perf = tk.Frame(tab_pro)
+        frame_pro_perf.pack(pady=(2, 2), padx=10, fill="x", anchor="w")
+
+        tk.Label(frame_pro_perf, text="Độ trễ API Smarty (giây):", font=("Arial", 10, "bold")).pack(side="left")
+        self.pro_delay_var = tk.StringVar(value="0")
+        self.entry_pro_delay = tk.Entry(frame_pro_perf, textvariable=self.pro_delay_var, width=8, font=("Consolas", 11), justify="center")
+        self.entry_pro_delay.pack(side="left", padx=10)
+
+        tk.Label(frame_pro_perf, text="Số luồng xử lý song song:", font=("Arial", 10, "bold")).pack(side="left", padx=(20, 5))
+        self.pro_worker_var = tk.StringVar(value=str(PRO_DEFAULT_WORKER_COUNT))
+        self.pro_worker_menu = tk.OptionMenu(frame_pro_perf, self.pro_worker_var, *[str(n) for n in range(1, PRO_MAX_WORKER_COUNT + 1)])
+        self.pro_worker_menu.config(width=5)
+        self.pro_worker_menu.pack(side="left")
+
+        tk.Label(
+            tab_pro,
+            text=("* Gói Pro có Rate Limit \"Unlimited lookups/sec\" -> tool sẽ dùng THẲNG cặp Auth ID/Auth Token của bạn, "
+                  "KHÔNG xoay vòng Proxy/Key, KHÔNG cần giãn cách 429 như tab bên cạnh. Bạn vẫn có thể tăng số luồng "
+                  "xử lý song song để tận dụng tối đa hạn mức Unlimited (giới hạn thực tế chỉ còn là tốc độ máy/mạng)."),
+            fg="#1da462", font=("Arial", 8), justify="left", wraplength=760
+        ).pack(anchor="w", padx=10, pady=(4, 8))
+
+        def _on_connection_tab_changed(event=None):
+            selected_text = self.connection_notebook.tab(self.connection_notebook.select(), "text")
+            new_mode = "pro" if selected_text.startswith("Đã có tài khoản Pro") else "free"
+            if new_mode != self.connection_mode_var.get():
+                self.connection_mode_var.set(new_mode)
+                if hasattr(self, "log_text"):
+                    if new_mode == "pro":
+                        self.log("[KẾT NỐI] Đã chuyển sang chế độ TÀI KHOẢN PRO: dùng 1 Key Pro trực tiếp, "
+                                  "không xoay vòng Proxy/Key, không giãn cách chống 429.")
+                    else:
+                        self.log("[KẾT NỐI] Đã chuyển về chế độ CHƯA CÓ TÀI KHOẢN PRO: xoay vòng Proxy/Key như cũ.")
+
+        self.connection_notebook.bind("<<NotebookTabChanged>>", _on_connection_tab_changed)
 
         frame_match = tk.LabelFrame(self.root, text=" Chế độ khớp địa chỉ Smarty (match) ", font=("Arial", 10, "bold"), fg="#0078D7")
         frame_match.pack(pady=10, padx=10, fill="x")
@@ -449,53 +542,18 @@ class SmartyApp:
         )
         self.lbl_match_note.pack(anchor="w", padx=10, pady=(0, 5))
 
-        frame_ai = tk.LabelFrame(self.root, text=" Kiểm tra kết quả đáng ngờ bằng AI (Miễn phí) ", font=("Arial", 10, "bold"), fg="#1da462")
+        frame_ai = tk.LabelFrame(self.root, text=" Kiểm tra kết quả đáng ngờ bằng AI (Thủ công) ", font=("Arial", 10, "bold"), fg="#1da462")
         frame_ai.pack(pady=10, padx=10, fill="x")
 
         self.use_ai_var = tk.BooleanVar(value=True)
-        self.chk_use_ai = tk.Checkbutton(frame_ai, text="Bật tự động kiểm tra trạng thái bằng AI", variable=self.use_ai_var, font=("Arial", 10), command=self.toggle_ai_input)
+        self.chk_use_ai = tk.Checkbutton(frame_ai, text="Bật kiểm tra trạng thái bằng AI (Thủ công)", variable=self.use_ai_var, font=("Arial", 10), command=self.toggle_ai_input)
         self.chk_use_ai.pack(anchor="w", padx=10, pady=5)
-
-        frame_mode = tk.Frame(frame_ai)
-        frame_mode.pack(anchor="w", padx=20, pady=(0, 5), fill="x")
-
-        self.ai_mode_var = tk.StringVar(value="manual")
-        self.rb_mode_auto = tk.Radiobutton(
-            frame_mode, variable=self.ai_mode_var, value="auto",
-            text="Tự động: hệ thống tự dò & gọi các AI miễn phí (Gemini / Groq / OpenRouter)",
-            font=("Arial", 9), justify="left", command=self.toggle_ai_input
-        )
-        self.rb_mode_auto.pack(anchor="w")
-
-        self.rb_mode_manual = tk.Radiobutton(
-            frame_mode, variable=self.ai_mode_var, value="manual",
-            text="Thủ công: Tool tạo sẵn Prompt để bạn dán vào AI ngoài (ChatGPT/Gemini web...), rồi dán JSON kết quả về",
-            font=("Arial", 9), justify="left", command=self.toggle_ai_input
-        )
-        self.rb_mode_manual.pack(anchor="w")
-
-        frame_ai_keys = tk.Frame(frame_ai)
-        frame_ai_keys.pack(fill="x", padx=20, pady=5)
-
-        lbl_gemini = tk.Label(frame_ai_keys, text="Gemini API Key:", width=18, anchor="w")
-        lbl_gemini.grid(row=0, column=0, sticky="w", pady=2)
-        self.entry_ai_key = tk.Entry(frame_ai_keys, width=45, font=("Consolas", 10), show="*")
-        self.entry_ai_key.grid(row=0, column=1, padx=5, pady=2)
-
-        lbl_groq = tk.Label(frame_ai_keys, text="Groq API Key (tuỳ chọn):", width=18, anchor="w")
-        lbl_groq.grid(row=1, column=0, sticky="w", pady=2)
-        self.entry_groq_key = tk.Entry(frame_ai_keys, width=45, font=("Consolas", 10), show="*")
-        self.entry_groq_key.grid(row=1, column=1, padx=5, pady=2)
-
-        lbl_openrouter = tk.Label(frame_ai_keys, text="OpenRouter API Key (tuỳ chọn):", width=18, anchor="w")
-        lbl_openrouter.grid(row=2, column=0, sticky="w", pady=2)
-        self.entry_openrouter_key = tk.Entry(frame_ai_keys, width=45, font=("Consolas", 10), show="*")
-        self.entry_openrouter_key.grid(row=2, column=1, padx=5, pady=2)
 
         self.lbl_ai_note = tk.Label(
             frame_ai,
-            text="* Chế độ Thủ công không cần API Key. Chế độ Tự động cần ít nhất 1 trong 3 API Key trên.",
-            fg="gray", font=("Arial", 8)
+            text=("* Tool tạo sẵn Prompt để bạn dán vào Grok hoặc DeepSeek, rồi dán JSON kết quả về. "
+                  "Không cần API Key."),
+            fg="gray", font=("Arial", 8), justify="left", wraplength=760
         )
         self.lbl_ai_note.pack(anchor="w", padx=20, pady=(0, 5))
 
@@ -512,9 +570,6 @@ class SmartyApp:
         # Khởi tạo trạng thái enable/disable theo đúng giá trị mặc định hiện tại của use_ai_var
         # (giờ mặc định BẬT), thay vì luôn khóa cứng như trước.
         self.toggle_ai_input()
-
-        if not HAS_GEMINI:
-            lbl_gemini.config(text="Gemini (chưa cài 'google-genai'):", fg="red")
 
         frame_btns = tk.Frame(self.root)
         frame_btns.pack(pady=10)
@@ -559,18 +614,11 @@ class SmartyApp:
         self.log_text = scrolledtext.ScrolledText(self.root, font=("Consolas", 10), width=95, height=18, bg="#1E1E1E", fg="#D4D4D4")
         self.log_text.pack(pady=5, padx=10)
 
-    def _set_ai_inputs_state(self, state):
-        self.entry_ai_key.config(state=state)
-        self.entry_groq_key.config(state=state)
-        self.entry_openrouter_key.config(state=state)
-        self.rb_mode_auto.config(state=state)
-        self.rb_mode_manual.config(state=state)
-
     def toggle_ai_input(self):
-        if self.use_ai_var.get():
-            self._set_ai_inputs_state(tk.NORMAL)
-        else:
-            self._set_ai_inputs_state(tk.DISABLED)
+        # Không còn field/key nào cần bật-tắt riêng cho AI nữa (chế độ Tự động đã bị loại bỏ,
+        # chế độ Thủ công không cần API Key) - giữ hàm lại để các nơi gọi cũ (vd reset_ui) không
+        # phải sửa, nhưng giờ chỉ còn ý nghĩa "để dành chỗ mở rộng sau này".
+        pass
 
     def log(self, message):
         self.log_text.insert(tk.END, message + "\n")
@@ -612,22 +660,30 @@ class SmartyApp:
             self.lbl_excel_path.config(text=self.excel_path, fg="black")
             self.btn_start.config(state=tk.NORMAL)
             self.log(f"Đã chọn file: {self.excel_path}")
-            if self.proxy_list:
-                self.log(f"Kết nối: dùng {len(self.proxy_list)} proxy từ data/proxies.txt; User-Agent cố định.")
-            else:
-                self.log("Kết nối: không có proxy, dùng IP thật; User-Agent cố định.")
-            if len(self.api_key_list) > 1:
-                self.log(f"Đã nạp {len(self.api_key_list)} Smarty Key từ file smarty_keys.txt (xoay vòng).")
-            else:
+            if self.connection_mode_var.get() == "pro":
+                self.log("Kết nối: TÀI KHOẢN PRO - gọi thẳng bằng 1 Key Pro, không dùng proxy, không xoay vòng key.")
                 self.log(
-                    "Chỉ đang dùng 1 API Key Smarty duy nhất (mặc định, không có smarty_keys.txt). "
-                    "Nếu Smarty trả về 429, tool sẽ tự chờ theo cooldown rồi thử lại; không đổi proxy để spam request. "
-                    "Hãy kiểm tra quota hoặc cấu hình API key hợp lệ trong thư mục data."
+                    "Vì License Pro có Rate Limit Unlimited lookups/sec nên tool sẽ KHÔNG giãn cách nhân tạo "
+                    "giữa các request (khác với tab 'Chưa có tài khoản Pro')."
                 )
-            self.log(
-                f"Khoảng cách tối thiểu giữa các request Smarty: {MIN_SMARTY_REQUEST_INTERVAL:.0f} giây; "
-                "khi 429 sẽ tự chờ rồi thử lại."
-            )
+            else:
+                if self.proxy_list:
+                    self.log(f"Kết nối: dùng {len(self.proxy_list)} proxy từ data/proxies.txt; User-Agent cố định.")
+                else:
+                    self.log("Kết nối: không có proxy, dùng IP thật; User-Agent cố định.")
+                if len(self.api_key_list) > 1:
+                    self.log(f"Đã nạp {len(self.api_key_list)} Smarty Key từ file smarty_keys.txt (xoay vòng).")
+                else:
+                    self.log(
+                        "Chỉ đang dùng 1 API Key Smarty duy nhất (mặc định, không có smarty_keys.txt). "
+                        "Nếu Smarty trả về 429, tool sẽ tự chờ theo cooldown rồi thử lại; không đổi proxy để spam request. "
+                        "Hãy kiểm tra quota hoặc cấu hình API key hợp lệ trong thư mục data, hoặc dùng tab "
+                        "'Đã có tài khoản Pro' nếu bạn có License Unlimited."
+                    )
+                self.log(
+                    f"Khoảng cách tối thiểu giữa các request Smarty: {MIN_SMARTY_REQUEST_INTERVAL:.0f} giây; "
+                    "khi 429 sẽ tự chờ rồi thử lại."
+                )
 
     # ================================================================================
     # LƯU / ĐỌC PHIÊN LÀM VIỆC CŨ (để có thể "Kiểm tra lại" bất cứ lúc nào, không cần
@@ -651,7 +707,10 @@ class SmartyApp:
             if not isinstance(data, dict):
                 return {}
             prefix = f"{match_mode}|"
-            return {key: value for key, value in data.items() if key.startswith(prefix) and isinstance(value, dict)}
+            return {
+                key: value for key, value in data.items()
+                if key.startswith(prefix) and self._is_valid_address_cache_entry(key, value)
+            }
         except (OSError, json.JSONDecodeError):
             return {}
 
@@ -663,13 +722,28 @@ class SmartyApp:
                 with open(path, "r", encoding="utf-8") as f:
                     stored = json.load(f)
                 if isinstance(stored, dict):
-                    all_cache.update(stored)
-            all_cache.update(cache)
+                    all_cache.update({
+                        key: value for key, value in stored.items()
+                        if self._is_valid_address_cache_entry(key, value)
+                    })
+            all_cache.update({
+                key: value for key, value in cache.items()
+                if self._is_valid_address_cache_entry(key, value)
+            })
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(all_cache, f, ensure_ascii=False)
             self.root.after(0, self._refresh_cache_info)
         except (OSError, json.JSONDecodeError) as e:
             self.log(f"    [!] Không lưu được cache Smarty: {e}")
+
+    @staticmethod
+    def _is_valid_address_cache_entry(key, value):
+        """Chỉ lưu phản hồi HTTP 200 của Smarty, tuyệt đối không lưu lỗi mạng/API."""
+        return (
+            isinstance(key, str)
+            and isinstance(value, dict)
+            and value.get("status_code") == 200
+        )
 
     def _save_session_to_disk(self, collected_data, source_excel_path="", output_excel_path=""):
         """Ghi đè lại file phiên gần nhất trên đĩa. Lưu TOÀN BỘ collected_data (bao gồm cả
@@ -743,7 +817,7 @@ class SmartyApp:
         proceed = messagebox.askyesno(
             "Kiểm tra lại phiên cũ",
             f"Phiên cũ có {n} dòng (đã gọi Smarty API từ trước - sẽ KHÔNG gọi lại Smarty).\n\n"
-            f"Tool sẽ mở lại cửa sổ để bạn dán Prompt qua AI ngoài (ChatGPT/Gemini...) và dán "
+            f"Tool sẽ mở lại cửa sổ để bạn dán Prompt qua Grok hoặc DeepSeek và dán "
             f"JSON kết quả mới vào, sau đó xuất lại 1 file Excel mới.\n\nBạn có muốn tiếp tục không?"
         )
         if not proceed:
@@ -775,7 +849,20 @@ class SmartyApp:
             self.log(f"[KIỂM TRA LẠI] Đang mở lại {len(collected_data)} dòng đã gọi Smarty trước đó "
                       f"để hỏi AI lại (không gọi lại Smarty API)...")
 
-            self.run_manual_flow(collected_data)
+            ai_completed = self.run_manual_flow(collected_data)
+
+            unresolved_items = self._get_unresolved_items(collected_data)
+            if not ai_completed or unresolved_items:
+                self.log(
+                    f"\n[CHƯA HOÀN TẤT] Không xuất Excel final khi kiểm tra lại: còn "
+                    f"{len(unresolved_items)} dòng chưa có kết luận hợp lệ."
+                )
+                messagebox.showwarning(
+                    "Chưa thể xuất Excel",
+                    f"Còn {len(unresolved_items)} dòng unknown hoặc chưa có trạng thái rõ ràng. "
+                    "Hãy tiếp tục kiểm tra lại trước khi xuất file final."
+                )
+                return
 
             self.log("\nĐang tạo lại file Excel...")
             final_path = self.export_excel(collected_data, save_path)
@@ -806,17 +893,31 @@ class SmartyApp:
         self.btn_stop.config(state=tk.DISABLED)
 
     def start_processing_thread(self):
-        try:
-            delay_val = float(self.delay_var.get())
-            if delay_val < 0: raise ValueError
-        except ValueError:
-            messagebox.showwarning("Cảnh báo", "Độ trễ không hợp lệ!")
-            return
+        pro_mode = self.connection_mode_var.get() == "pro"
 
-        if self.use_ai_var.get() and self.ai_mode_var.get() == "auto":
-            keys = [self.entry_ai_key.get().strip(), self.entry_groq_key.get().strip(), self.entry_openrouter_key.get().strip()]
-            if not any(keys):
-                messagebox.showwarning("Cảnh báo", "Chế độ Tự động cần ít nhất 1 API Key!\nHoặc chuyển sang chế độ Thủ công.")
+        if pro_mode:
+            try:
+                delay_val = float(self.pro_delay_var.get())
+                if delay_val < 0: raise ValueError
+            except ValueError:
+                messagebox.showwarning("Cảnh báo", "Độ trễ (tab Pro) không hợp lệ!")
+                return
+            if not self.pro_auth_id_var.get().strip() or not self.pro_auth_token_var.get().strip():
+                messagebox.showwarning(
+                    "Cảnh báo",
+                    "Bạn đang ở tab 'Đã có tài khoản Pro' nhưng chưa nhập đủ Auth ID và Auth Token!\n\n"
+                    "Lấy tại: smarty.com -> Account -> API Keys -> tab 'Secret Keys' -> Generate secret key."
+                )
+                return
+            if not self.pro_license_var.get().strip():
+                messagebox.showwarning("Cảnh báo", "Bạn đang ở tab 'Đã có tài khoản Pro' nhưng chưa nhập License value!")
+                return
+        else:
+            try:
+                delay_val = float(self.delay_var.get())
+                if delay_val < 0: raise ValueError
+            except ValueError:
+                messagebox.showwarning("Cảnh báo", "Độ trễ không hợp lệ!")
                 return
 
         save_path = filedialog.asksaveasfilename(
@@ -841,11 +942,27 @@ class SmartyApp:
         self.btn_clear_cache.config(state=tk.DISABLED)
         self.entry_delay.config(state=tk.DISABLED)
         self.worker_menu.config(state=tk.DISABLED)
+        self.entry_pro_auth_id.config(state=tk.DISABLED)
+        self.entry_pro_auth_token.config(state=tk.DISABLED)
+        self.entry_pro_license.config(state=tk.DISABLED)
+        self.entry_pro_delay.config(state=tk.DISABLED)
+        self.pro_worker_menu.config(state=tk.DISABLED)
+        for i in range(len(self.connection_notebook.tabs())):
+            self.connection_notebook.tab(i, state="disabled")
         self.rb_match_strict.config(state=tk.DISABLED)
         self.rb_match_enhanced.config(state=tk.DISABLED)
         self.chk_use_ai.config(state=tk.DISABLED)
-        self._set_ai_inputs_state(tk.DISABLED)
-        self.log(f"Số luồng proxy đã chọn: {self.worker_var.get()} (API dùng hàng đợi tuần tự có rate-limit chung).")
+
+        if pro_mode:
+            self._min_smarty_interval = PRO_MIN_SMARTY_REQUEST_INTERVAL
+            self.log(
+                f"[KẾT NỐI] Chế độ: TÀI KHOẢN PRO | Số luồng song song: {self.pro_worker_var.get()} | "
+                f"Không xoay vòng Proxy/Key, không giãn cách chống 429 (License Unlimited lookups/sec)."
+            )
+        else:
+            self._min_smarty_interval = MIN_SMARTY_REQUEST_INTERVAL
+            self.log(f"[KẾT NỐI] Chế độ: CHƯA CÓ TÀI KHOẢN PRO | Số luồng proxy đã chọn: {self.worker_var.get()} "
+                      f"(API dùng hàng đợi tuần tự có rate-limit chung).")
 
         threading.Thread(target=self.process_data, daemon=True).start()
 
@@ -862,9 +979,16 @@ class SmartyApp:
         self._smarty_backoff_until = 0.0
         self._smarty_rate_limit_streak = 0
 
+        pro_mode = self.connection_mode_var.get() == "pro"
+
         try:
             self._refresh_proxies_if_changed()
-            delay_seconds = float(self.delay_var.get())
+            if pro_mode:
+                delay_seconds = float(self.pro_delay_var.get())
+                self._min_smarty_interval = PRO_MIN_SMARTY_REQUEST_INTERVAL
+            else:
+                delay_seconds = float(self.delay_var.get())
+                self._min_smarty_interval = MIN_SMARTY_REQUEST_INTERVAL
             self.log("Đang đọc dữ liệu từ file Excel...")
             df = pd.read_excel(self.excel_path)
 
@@ -890,7 +1014,12 @@ class SmartyApp:
             cache_dirty = False
             new_cache_count = 0
 
-            worker_count = min(int(self.worker_var.get()), self._max_worker_count())
+            if pro_mode:
+                worker_count = min(int(self.pro_worker_var.get()), PRO_MAX_WORKER_COUNT)
+                retry_fn = self.call_smarty_api_with_retry_pro
+            else:
+                worker_count = min(int(self.worker_var.get()), self._max_worker_count())
+                retry_fn = self.call_smarty_api_with_retry
             api_executor = ThreadPoolExecutor(max_workers=worker_count)
             api_futures = {}
             for future_index, future_row in df.iterrows():
@@ -905,9 +1034,12 @@ class SmartyApp:
                 future_key = self._address_cache_key(future_input, match_mode)
                 if future_key not in smarty_cache and future_key not in api_futures:
                     api_futures[future_key] = api_executor.submit(
-                        self.call_smarty_api_with_retry, future_input, 3, future_index + 1
+                        retry_fn, future_input, 3, future_index + 1
                     )
-            self.log(f"Đã khởi chạy {worker_count} luồng proxy có rate limiter chung.")
+            if pro_mode:
+                self.log(f"Đã khởi chạy {worker_count} luồng xử lý song song (tài khoản Pro - không proxy).")
+            else:
+                self.log(f"Đã khởi chạy {worker_count} luồng proxy có rate limiter chung.")
 
             f_handle = self._open_output_txt_with_retry(self.txt_output_path)
             self.txt_output_path = f_handle.name
@@ -959,6 +1091,16 @@ class SmartyApp:
                                 f"[KHÔNG XUẤT EXCEL] Dòng {index + 1} chưa có phản hồi HTTP 200 "
                                 f"(HTTP {outcome.get('status_code')})."
                             )
+                            if outcome.get("status_code") == 401 and pro_mode:
+                                self.log(
+                                    "[GỢI Ý] HTTP 401 = sai thông tin xác thực. Với tab 'Đã có tài khoản Pro', hãy kiểm tra lại:\n"
+                                    "  1) Auth ID và Auth Token đã copy ĐÚNG và ĐỦ (không thiếu ký tự đầu/cuối)?\n"
+                                    "  2) Đây có phải cặp \"Secret Key\" không (smarty.com -> Account -> API Keys -> tab "
+                                    "'Secret Keys' -> Generate secret key)? KHÔNG dùng 'Embedded Keys' (loại đó cần "
+                                    "whitelist domain website, không dùng được cho tool chạy trên máy).\n"
+                                    "  3) License value có đúng với gói bạn đang có không (xem trong trang quản lý License "
+                                    "của tài khoản Smarty, mục 'License Value')?"
+                                )
                             break
                         if outcome.get("status_code") == 200:
                             smarty_cache[cache_key] = outcome.copy()
@@ -1048,7 +1190,7 @@ class SmartyApp:
                 if not self.stop_requested:
                     gpt_prompt = """
 =======================================================================================================================
-[SYSTEM PROMPT - DÀNH CHO AI/CHATGPT/GEMINI]
+[SYSTEM PROMPT - DÀNH CHO GROK/DEEPSEEK]
 Nhiệm vụ của bạn là đóng vai trò chuyên gia kiểm duyệt địa chỉ quốc tế khắt khe. Dựa vào danh sách đối chiếu bên trên (định dạng: (chuỗi gốc : chuỗi chuẩn hóa từ API | Analysis: <cảnh báo DPV nếu có> [Mã đơn hàng])), hãy thực hiện:
 
 1. QUÉT TOÀN BỘ danh sách và LỌC RA những đơn hàng CÓ DẤU HIỆU ĐÁNG NGỜ hoặc LỖI.
@@ -1075,20 +1217,24 @@ TUYỆT ĐỐI KHÔNG đưa các đơn hàng hoàn toàn hợp lệ (không lỗ
                 )
                 return
 
+            ai_completed = True
             if self.use_ai_var.get() and not self.stop_requested and collected_data:
                 self.log("\n===========================================")
                 self.log("Bắt đầu giai đoạn 2: Kiểm tra kết quả đáng ngờ bằng AI...")
 
-                mode = self.ai_mode_var.get()
-                if mode == "manual":
-                    self.log("Chế độ: THỦ CÔNG (bạn tự dán Prompt vào AI ngoài).")
-                    self.run_manual_flow(collected_data)
-                else:
-                    self.log("Chế độ: TỰ ĐỘNG (hệ thống tự dò & gọi AI miễn phí).")
-                    self.run_auto_flow(collected_data)
+                self.log("Chế độ: THỦ CÔNG (bạn tự dán Prompt vào AI ngoài).")
+                ai_completed = self.run_manual_flow(collected_data)
 
             elif not self.use_ai_var.get():
-                self.log("\n[INFO] AI tự động đang TẮT. File TXT đã có Prompt để bạn tự check thủ công.")
+                self.log("\n[INFO] Kiểm tra bằng AI đang TẮT. File TXT đã có Prompt để bạn tự check thủ công.")
+
+            unresolved_items = self._get_unresolved_items(collected_data)
+            if not ai_completed or unresolved_items:
+                self.log(
+                    f"\n[CHƯA HOÀN TẤT] Không xuất Excel final: còn "
+                    f"{len(unresolved_items)} dòng chưa có kết luận hợp lệ."
+                )
+                return
 
             if collected_data:
                 self.log("\nBắt đầu tạo file Excel...")
@@ -1122,251 +1268,88 @@ TUYỆT ĐỐI KHÔNG đưa các đơn hàng hoàn toàn hợp lệ (không lỗ
                 self._save_session_to_disk(collected_data, source_excel_path=self.excel_path)
             self.reset_ui()
 
-    def run_auto_flow(self, collected_data):
-        BATCH_SIZE = 20
-        n = len(collected_data)
-        self.log(f"Tổng {n} dòng -> chia thành các batch {BATCH_SIZE} dòng/lượt gọi AI.")
-
-        idx = 0
-        while idx < n:
-            if self.stop_requested:
-                return
-            batch = collected_data[idx: idx + BATCH_SIZE]
-            batch_no = idx // BATCH_SIZE + 1
-            total_batches = (n + BATCH_SIZE - 1) // BATCH_SIZE
-            self.log(f"-> Đang thử gọi AI tự động cho batch {batch_no}/{total_batches} ({len(batch)} dòng)...")
-
-            results_map = self.check_with_ai_batch_auto(batch)
-
-            if results_map is None:
-                self.log("    [!] Không có nhà cung cấp AI miễn phí nào phản hồi thành công cho batch này.")
-                remaining_items = collected_data[idx:]
-                want_manual = self.ask_switch_to_manual(
-                    f"Hệ thống không gọi được AI tự động.\n"
-                    f"Còn {len(remaining_items)} dòng chưa được kiểm tra."
-                )
-                if want_manual:
-                    self.log("-> Người dùng chọn chuyển sang chế độ THỦ CÔNG cho các dòng còn lại.")
-                    self.run_manual_flow(remaining_items)
-                else:
-                    self.log("-> Người dùng chọn bỏ qua kiểm tra AI cho các dòng còn lại.")
-                    for item in remaining_items:
-                        self._apply_ai_result_with_analysis(
-                            item, None,
-                            missing_reason="Bỏ qua kiểm tra AI (không gọi được AI tự động)"
-                        )
-                return
-
-            for item in batch:
-                rid = item["Reference Id"]
-                res = results_map.get(rid)
-                self._apply_ai_result_with_analysis(item, res)
-
-            self.log(f"-> Batch {batch_no}/{total_batches} hoàn tất.")
-            idx += BATCH_SIZE
-            if idx < n:
-                time.sleep(1.0)
-
-    def check_with_ai_batch_auto(self, items):
-        prompt = self._build_ai_prompt(items)
-        raw = self.call_any_available_ai(prompt)
-        if raw is None:
-            return None
-        return self._parse_ai_json_array(raw)
-
-    def call_any_available_ai(self, prompt):
-        gemini_key = self.entry_ai_key.get().strip()
-        groq_key = self.entry_groq_key.get().strip()
-        openrouter_key = self.entry_openrouter_key.get().strip()
-
-        providers = []
-        if gemini_key and HAS_GEMINI:
-            providers.append(("Gemini", lambda: self._call_gemini_fast(prompt, gemini_key)))
-        if groq_key:
-            providers.append(("Groq", lambda: self._call_groq(prompt, groq_key)))
-        if openrouter_key:
-            providers.append(("OpenRouter", lambda: self._call_openrouter(prompt, openrouter_key)))
-
-        if not providers:
-            self.log("    [!] Chưa nhập bất kỳ API Key nào cho chế độ Tự động.")
-            return None
-
-        for name, fn in providers:
-            if self.stop_requested:
-                return None
-            self.log(f"    -> Đang thử {name}...")
-            try:
-                raw = fn()
-                if raw and raw.strip():
-                    self.log(f"    [OK] {name} phản hồi thành công.")
-                    return raw
-                self.log(f"    [!] {name} trả về rỗng, thử provider kế tiếp...")
-            except Exception as e:
-                self.log(f"    [!] {name} lỗi: {str(e)[:120]}")
-                continue
-
-        return None
-
-    def _call_gemini_fast(self, prompt, api_key):
-        client = genai.Client(api_key=api_key)
-        models = self._quick_discover_gemini_models(client) or GEMINI_FALLBACK_MODELS
-        last_err = None
-
-        for model_name in models[:2]:
-            for attempt in range(2):
-                if self.stop_requested:
-                    return None
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=genai_types.GenerateContentConfig(
-                            temperature=0.0,
-                            response_mime_type="application/json"
-                        )
-                    )
-                    return (response.text or "").strip()
-                except Exception as e:
-                    last_err = e
-                    es = str(e).lower()
-                    if "404" in es or "not found" in es:
-                        break
-                    if "429" in es or "503" in es or "overloaded" in es or "unavailable" in es or "quota" in es:
-                        if attempt == 0:
-                            time.sleep(3)
-                            continue
-                        break
-                    break
-
-        if last_err:
-            raise last_err
-        raise RuntimeError("Gemini không khả dụng")
-
-    def _quick_discover_gemini_models(self, client):
-        try:
-            discovered = []
-            for m in client.models.list():
-                name = getattr(m, "name", "") or ""
-                short = name.split("/")[-1] if "/" in name else name
-                if not short:
-                    continue
-                actions = getattr(m, "supported_actions", None) or []
-                if actions and "generateContent" not in actions:
-                    continue
-                low = short.lower()
-                if any(x in low for x in ["embedding", "tts", "image", "video", "vision", "aqa", "gemma"]):
-                    continue
-                if "flash" not in low and "pro" not in low:
-                    continue
-                discovered.append(short)
-
-            def priority(name):
-                n = name.lower()
-                if "flash-lite" in n:
-                    return 1
-                if n.endswith("-latest") and "flash" in n:
-                    return 0
-                if "flash" in n:
-                    return 2
-                if "pro" in n:
-                    return 3
-                return 4
-
-            discovered = sorted(set(discovered), key=priority)
-            return discovered
-        except Exception:
-            return []
-
-    def _call_groq(self, prompt, api_key):
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        last_err = None
-        for model_name in GROQ_MODELS[:2]:
-            body = {
-                "model": model_name,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0
-            }
-            try:
-                r = self.session.post(url, headers=headers, json=body, timeout=20)
-                if r.status_code == 200:
-                    data = r.json()
-                    return data["choices"][0]["message"]["content"]
-                elif r.status_code == 404:
-                    last_err = RuntimeError(f"Model '{model_name}' không tồn tại trên Groq")
-                    continue
-                elif r.status_code == 429:
-                    last_err = RuntimeError("Groq quá tải/hết quota (429)")
-                    time.sleep(2)
-                    continue
-                else:
-                    last_err = RuntimeError(f"Groq lỗi HTTP {r.status_code}: {r.text[:150]}")
-                    continue
-            except requests.exceptions.RequestException as e:
-                last_err = e
-                continue
-        raise last_err or RuntimeError("Groq thất bại")
-
-    def _call_openrouter(self, prompt, api_key):
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        last_err = None
-        for model_name in OPENROUTER_MODELS:
-            body = {
-                "model": model_name,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0
-            }
-            try:
-                r = self.session.post(url, headers=headers, json=body, timeout=20)
-                if r.status_code == 200:
-                    data = r.json()
-                    return data["choices"][0]["message"]["content"]
-                elif r.status_code == 404:
-                    last_err = RuntimeError(f"Model '{model_name}' không tồn tại trên OpenRouter")
-                    continue
-                elif r.status_code == 429:
-                    last_err = RuntimeError("OpenRouter quá tải/hết quota (429)")
-                    time.sleep(2)
-                    continue
-                else:
-                    last_err = RuntimeError(f"OpenRouter lỗi HTTP {r.status_code}: {r.text[:150]}")
-                    continue
-            except requests.exceptions.RequestException as e:
-                last_err = e
-                continue
-        raise last_err or RuntimeError("OpenRouter thất bại")
+    @staticmethod
+    def _get_unresolved_items(items):
+        return [
+            item for item in items
+            if str(item.get("Trạng thái xử lý", "") or "").strip().lower()
+            not in ("true", "false", "suspect")
+        ]
 
     def run_manual_flow(self, items):
         if not items:
-            return
-        self.log(f"[THỦ CÔNG] Đang tạo Prompt cho {len(items)} dòng để bạn sao chép...")
-        prompt = self._build_ai_prompt(items)
+            return True
+        pending_items = list(items)
+        round_number = 1
 
-        json_text = self.get_manual_json_from_user(prompt, len(items))
+        while pending_items and round_number <= AI_MAX_COMPLETION_ROUNDS:
+            self.log(
+                f"[THỦ CÔNG] Đang tạo Prompt lượt {round_number} cho "
+                f"{len(pending_items)} dòng để bạn sao chép..."
+            )
+            prompt = self._build_ai_prompt(pending_items, round_number=round_number)
+            prompt_file_path = self._save_large_ai_prompt(prompt, round_number)
+            json_text = self.get_manual_json_from_user(
+                prompt, len(pending_items), round_number, prompt_file_path
+            )
 
-        if not json_text:
-            self.log("    [!] Bạn đã bỏ qua bước nhập JSON thủ công -> giữ nguyên cờ Analysis (nếu có), còn lại 'unknown'.")
-            for item in items:
-                self._apply_ai_result_with_analysis(
-                    item, None,
-                    missing_reason="Bỏ qua kiểm tra AI thủ công"
+            if not json_text:
+                self.log("    [!] Bạn đã bỏ qua kiểm tra AI; các dòng chưa có kết quả sẽ ở trạng thái 'unknown'.")
+                for item in pending_items:
+                    self._apply_ai_result_with_analysis(
+                        item, None, missing_reason="Bỏ qua kiểm tra AI thủ công"
+                    )
+                return False
+
+            results_map = self._parse_ai_json_array(json_text)
+            pending_ids = {str(item["Reference Id"]) for item in pending_items}
+            valid_results = {
+                result_id: result
+                for result_id, result in results_map.items()
+                if result_id in pending_ids
+            }
+            missing_count = len(pending_ids) - len(valid_results)
+            unexpected_count = len(results_map) - len(valid_results)
+
+            self.log(
+                f"    [KẾT QUẢ AI LƯỢT {round_number}] "
+                f"TỔNG: {len(pending_ids)} | ĐÃ NHẬN: {len(valid_results)} | "
+                f"CÒN THIẾU: {missing_count}"
+            )
+            if unexpected_count:
+                self.log(
+                    f"    [KẾT QUẢ AI] Bỏ qua {unexpected_count} ID không thuộc danh sách "
+                    "đang chờ xử lý."
                 )
-            return
 
-        results_map = self._parse_ai_json_array(json_text)
-        if not results_map:
-            self.log("    [!] Không đọc được JSON hợp lệ từ nội dung bạn dán vào -> các dòng này sẽ ở trạng thái 'unknown'.")
+            for item in pending_items:
+                rid = str(item["Reference Id"])
+                if rid in valid_results:
+                    self._apply_ai_result_with_analysis(item, valid_results[rid])
 
-        for item in items:
-            rid = item["Reference Id"]
-            res = results_map.get(rid)
-            if res is None:
-                self._apply_ai_result_with_analysis(item, None, missing_reason="Không thấy id này trong JSON đã nhập")
-            else:
-                self._apply_ai_result_with_analysis(item, res)
+            pending_items = [
+                item for item in pending_items
+                if str(item["Reference Id"]) not in valid_results
+            ]
+            self.log(
+                f"    -> Đã ghi nhận lượt {round_number}: "
+                f"{len(valid_results)} dòng; còn thiếu {len(pending_items)} dòng."
+            )
+            round_number += 1
 
-        self.log(f"    -> Đã áp dụng kết quả thủ công cho {len(items)} dòng.")
+        if pending_items:
+            self.log(
+                f"    [!] Sau {AI_MAX_COMPLETION_ROUNDS} lượt vẫn còn "
+                f"{len(pending_items)} dòng chưa có kết quả; các dòng này sẽ ở trạng thái 'unknown'."
+            )
+            for item in pending_items:
+                self._apply_ai_result_with_analysis(
+                    item, None, missing_reason="AI không trả về ID sau số lượt tối đa"
+                )
+            return False
+        else:
+            self.log("    -> Đã nhận đủ kết quả cho toàn bộ dòng cần kiểm tra.")
+            return not self._get_unresolved_items(items)
 
     def _apply_ai_result_with_analysis(self, item, res, missing_reason="Không nhận được kết quả từ AI cho dòng này"):
         """Gộp kết quả AI (true/suspect/false) với cờ nghi ngờ tính sẵn từ 'analysis'
@@ -1389,9 +1372,27 @@ TUYỆT ĐỐI KHÔNG đưa các đơn hàng hoàn toàn hợp lệ (không lỗ
         ai_status = res.get("status", "unknown")
         ai_reason = (res.get("reason", "") or "").strip()
 
+        if ai_status not in ("true", "false", "suspect"):
+            invalid_status_reason = ai_reason or (
+                "AI trả về trạng thái không hợp lệ hoặc không có trạng thái rõ ràng"
+            )
+            if analysis_reasons:
+                item["Trạng thái xử lý"] = "suspect"
+                item["Lý do đáng ngờ"] = (
+                    f"{invalid_status_reason} | Cảnh báo Analysis: {analysis_text}"
+                )
+            else:
+                item["Trạng thái xử lý"] = "unknown"
+                item["Lý do đáng ngờ"] = invalid_status_reason
+            return
+
         if not analysis_reasons:
             item["Trạng thái xử lý"] = ai_status
-            item["Lý do đáng ngờ"] = ai_reason
+            item["Lý do đáng ngờ"] = (
+                ai_reason if ai_reason else
+                ("AI xác nhận hợp lệ" if ai_status == "true" else
+                 "AI chưa cung cấp lý do cho trạng thái bất thường")
+            )
             return
 
         # Có cảnh báo từ analysis: AI nói "false" -> vẫn giữ "false" (nặng hơn).
@@ -1491,26 +1492,28 @@ TUYỆT ĐỐI KHÔNG đưa các đơn hàng hoàn toàn hợp lệ (không lỗ
                 path = self._alt_path_with_timestamp(desired_path)
                 self.log(f"  [i] Sẽ lưu file Excel sang tên khác: {path}")
 
-    def ask_switch_to_manual(self, reason_text):
-        result_holder = {"value": False}
-        event = threading.Event()
+    def _save_large_ai_prompt(self, prompt_text, round_number):
+        if len(prompt_text) <= AI_PROMPT_FILE_THRESHOLD_CHARS:
+            return ""
 
-        def _build():
-            try:
-                ans = messagebox.askyesno(
-                    "Không gọi được AI tự động",
-                    f"{reason_text}\n\nBạn có muốn chuyển sang chế độ THỦ CÔNG "
-                    f"(tự dán Prompt vào AI ngoài, rồi dán JSON kết quả về) không?"
-                )
-                result_holder["value"] = bool(ans)
-            finally:
-                event.set()
+        base_path = getattr(self, "txt_output_path", "")
+        if base_path:
+            base_path = os.path.splitext(base_path)[0]
+        else:
+            base_path = os.path.join(self.session_state_dir, "smarty_ai_prompt")
+        path = f"{base_path}_round_{round_number}.txt"
+        try:
+            with open(path, "w", encoding="utf-8") as prompt_file:
+                prompt_file.write(prompt_text)
+            self.log(
+                f"    [i] Prompt dài {len(prompt_text):,} ký tự; đã lưu thành file: {path}"
+            )
+            return path
+        except OSError as error:
+            self.log(f"    [!] Không lưu được file Prompt: {error}")
+            return ""
 
-        self.root.after(0, _build)
-        event.wait()
-        return result_holder["value"]
-
-    def get_manual_json_from_user(self, prompt_text, item_count):
+    def get_manual_json_from_user(self, prompt_text, item_count, round_number=1, prompt_file_path=""):
         result_holder = {"value": None}
         event = threading.Event()
 
@@ -1520,23 +1523,40 @@ TUYỆT ĐỐI KHÔNG đưa các đơn hàng hoàn toàn hợp lệ (không lỗ
             dlg.geometry("720x650")
             dlg.grab_set()
 
-            # Tự động mở sẵn 1 tab trình duyệt tới ChatGPT ngay khi vào giai đoạn này, để người
-            # dùng chỉ cần bấm "Sao chép Prompt" rồi qua tab đó dán vào, không cần tự mở tay.
-            # Best-effort: nếu máy không có trình duyệt mặc định hoặc mở thất bại thì bỏ qua,
-            # không làm gián đoạn luồng thủ công (người dùng vẫn có thể tự mở trình duyệt).
-            try:
-                webbrowser.open("https://gemini.google.com/")
-            except Exception as e:
-                self.log(f"    [!] Không tự mở được trình duyệt ChatGPT: {e}")
+            # Mở Grok và DeepSeek cùng lúc ở lượt đầu tiên. Các lượt hỏi thiếu sau đó
+            # dùng lại hai cửa sổ đang có, không tạo thêm tab/cửa sổ gây lag máy.
+            if not self._ai_browsers_opened:
+                self._ai_browsers_opened = True
+                try:
+                    grok_opened = webbrowser.open_new("https://grok.com/")
+                    deepseek_opened = webbrowser.open_new("https://chat.deepseek.com/")
+                    self.log(
+                        "    [i] Đã gửi lệnh mở Grok và DeepSeek lần đầu; "
+                        "các lượt sau sẽ không mở thêm cửa sổ/tab."
+                    )
+                    if not grok_opened or not deepseek_opened:
+                        self.log("    [!] Không xác nhận được một trong hai lệnh mở; hãy dùng cửa sổ AI đang có hoặc mở thủ công.")
+                except Exception as e:
+                    self.log(f"    [!] Không tự mở được Grok/DeepSeek: {e}")
+            else:
+                self.log("    [i] Grok và DeepSeek đã được mở trước đó; không mở thêm cửa sổ/tab.")
+
+            prompt_file_note = ""
+            if prompt_file_path:
+                prompt_file_note = (
+                    f"\nPrompt dài đã được lưu tại:\n{prompt_file_path}\n"
+                    "Bạn có thể tải file TXT này lên Grok hoặc DeepSeek thay vì dán toàn bộ nội dung."
+                )
 
             tk.Label(
                 dlg,
-                text=(f"Có {item_count} dòng cần kiểm tra.\n"
-                      "Đã tự mở sẵn 1 tab trình duyệt ChatGPT VÀ tự sao chép Prompt vào Clipboard cho bạn.\n"
-                      "1) Qua tab ChatGPT (hoặc AI bất kỳ khác: Gemini web, Claude...), dán (Ctrl+V) là được. "
+                text=(f"Lượt {round_number} - Có {item_count} dòng cần kiểm tra.\n"
+                      "Đã tự mở Grok và DeepSeek VÀ tự sao chép Prompt vào Clipboard cho bạn.\n"
+                      "1) Qua cửa sổ Grok hoặc DeepSeek, dán (Ctrl+V) là được. "
                       "(Nút 'Sao chép Prompt' bên dưới vẫn dùng được để bấm lại nếu cần.)\n"
                       "2) Sao chép TOÀN BỘ phần JSON mà AI trả về, dán vào ô phía dưới.\n"
-                      "3) Bấm 'Xác nhận' để tool tự tạo Excel."),
+                      "3) Bấm 'Xác nhận'. Tool sẽ tự hỏi lại các ID bị thiếu."
+                      f"{prompt_file_note}"),
                 justify="left", anchor="w"
             ).pack(anchor="w", padx=10, pady=(10, 5))
 
@@ -1590,7 +1610,7 @@ TUYỆT ĐỐI KHÔNG đưa các đơn hàng hoàn toàn hợp lệ (không lỗ
         event.wait()
         return result_holder["value"]
 
-    def _build_ai_prompt(self, items):
+    def _build_ai_prompt(self, items, round_number=1):
         payload = [
             {
                 "id": it["Reference Id"],
@@ -1610,6 +1630,7 @@ TUYỆT ĐỐI KHÔNG đưa các đơn hàng hoàn toàn hợp lệ (không lỗ
         ]
 
         prompt = f"""Bạn là chuyên gia kiểm duyệt địa chỉ vận chuyển quốc tế, làm việc rất khắt khe và chính xác.
+    Đây là lượt kiểm tra {round_number}. Chỉ xử lý đúng các phần tử có trong JSON bên dưới; không tự bỏ qua phần tử nào.
 Dưới đây là một danh sách JSON gồm nhiều đơn hàng. Mỗi phần tử có:
 - "id": mã đơn hàng
 - "in": chuỗi địa chỉ gốc
@@ -1668,6 +1689,13 @@ Danh sách đầu vào (JSON):
         return result_map
 
     def export_excel(self, collected_data, output_path):
+        unresolved_items = self._get_unresolved_items(collected_data)
+        if unresolved_items:
+            raise ValueError(
+                f"Không thể xuất Excel final: còn {len(unresolved_items)} dòng "
+                "unknown hoặc chưa có trạng thái xử lý hợp lệ."
+            )
+
         for item in collected_data:
             item.setdefault("DPV Match Code", "")
             item.setdefault("DPV Vacant", "")
@@ -1678,6 +1706,14 @@ Danh sách đầu vào (JSON):
             item.setdefault("Footnotes", "")
             item.setdefault("Trạng thái xử lý", "")
             item.setdefault("Lý do đáng ngờ", "")
+
+            status = str(item.get("Trạng thái xử lý", "") or "").strip().lower()
+            reason = str(item.get("Lý do đáng ngờ", "") or "").strip()
+            if status in ("", "unknown") and not reason:
+                item["Trạng thái xử lý"] = "unknown"
+                item["Lý do đáng ngờ"] = (
+                    "Chưa có kết luận rõ ràng từ AI hoặc chưa được kiểm tra AI"
+                )
 
         # false (lỗi) đứng trước, kế đến suspect (nghi ngờ - cần xem lại analysis),
         # rồi unknown (chưa kiểm tra được), cuối cùng true (chắc chắn đúng).
@@ -1761,19 +1797,38 @@ Danh sách đầu vào (JSON):
         # "vá"/suy đoán). Người dùng có thể tự đổi sang "enhanced" nếu muốn Smarty khớp mạnh
         # tay hơn, nhưng "strict" là lựa chọn được khuyến khích.
         match_mode = self.match_mode_var.get() if self.match_mode_var.get() in ("strict", "enhanced") else "strict"
-        params = {
-            "key": identity["api_key"], "agent": "smarty (website:demo)",
-            "match": match_mode, "candidates": "5", "geocode": "true",
-            "license": "us-rooftop-geocoding-cloud", "street": street_input
-        }
+
+        # Smarty có 2 kiểu xác thực khác nhau:
+        # 1) "Embedded key" (website key): 1 tham số "key" duy nhất, CHỈ hoạt động nếu Referer
+        #    khớp đúng domain đã whitelist trong tài khoản Smarty - đây là kiểu tab "Chưa có tài
+        #    khoản Pro" đang dùng (giữ nguyên logic cũ, không đổi).
+        # 2) "Secret key" (Auth ID + Auth Token): 2 tham số "auth-id"/"auth-token", KHÔNG bị giới
+        #    hạn theo domain - đây là kiểu tài khoản Pro/Cloud License trả phí thường được cấp,
+        #    dùng cho tab "Đã có tài khoản Pro".
+        if identity.get("auth_mode") == "secret":
+            params = {
+                "auth-id": identity.get("auth_id", ""),
+                "auth-token": identity.get("auth_token", ""),
+                "match": match_mode, "candidates": "5", "geocode": "true",
+                "license": identity.get("license") or DEFAULT_LICENSE_VALUE, "street": street_input
+            }
+        else:
+            params = {
+                "key": identity["api_key"], "agent": "smarty (website:demo)",
+                "match": match_mode, "candidates": "5", "geocode": "true",
+                "license": identity.get("license") or DEFAULT_LICENSE_VALUE, "street": street_input
+            }
 
         proxy_url = identity.get("proxy_url")
         proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
 
         try:
             with self._request_rate_lock:
+                # self._min_smarty_interval được đặt bằng MIN_SMARTY_REQUEST_INTERVAL (chưa có
+                # tài khoản Pro) hoặc PRO_MIN_SMARTY_REQUEST_INTERVAL (đã có tài khoản Pro, mặc
+                # định 0 - không giãn cách) ngay khi bắt đầu xử lý, tuỳ theo tab đang chọn.
                 elapsed = time.monotonic() - self._last_smarty_request_at
-                wait_for = MIN_SMARTY_REQUEST_INTERVAL - elapsed
+                wait_for = self._min_smarty_interval - elapsed
                 wait_for = max(wait_for, self._smarty_backoff_until - time.monotonic())
                 if wait_for > 0:
                     time.sleep(wait_for)
@@ -1923,6 +1978,74 @@ Danh sách đầu vào (JSON):
             retry_identity = next_identity()
 
         return {"result": "Bị dừng", "analysis": {}, "stopped": True}
+
+    def call_smarty_api_with_retry_pro(self, street_input, max_retries, row_num):
+        """Phiên bản dành riêng cho tab 'Đã có tài khoản Pro'. KHÔNG xoay vòng Proxy/Key vì:
+        - Chỉ có DUY NHẤT 1 cặp Secret Key (Auth ID + Auth Token) của người dùng.
+        - Không cần proxy (gọi thẳng bằng IP thật) vì hạn mức 'Unlimited lookups/sec' được cấp
+          theo TÀI KHOẢN, không phải theo IP, nên đổi proxy không giúp ích gì và chỉ làm chậm.
+        Dùng đúng kiểu xác thực "Secret Key" (auth-id/auth-token) - KHÁC với "Embedded key" (1
+        key + Referer whitelist theo domain) mà tab "Chưa có tài khoản Pro" đang dùng. Nếu vẫn
+        gửi theo kiểu Embedded key (hoặc giả Referer smarty.com) cho tài khoản Pro thật, Smarty
+        sẽ trả về HTTP 401 vì Referer không khớp domain đã đăng ký / thiếu tham số auth-token.
+        Vẫn giữ khả năng thử lại khi gặp lỗi mạng tạm thời hoặc 429 hiếm gặp (vd do vượt giới
+        hạn đồng thời phần cứng/mạng phía người dùng), nhưng đơn giản hơn nhiều: chỉ chờ rồi
+        gọi lại với CHÍNH cặp key đó, tối đa PRO_MAX_RETRIES lần."""
+        auth_id = self.pro_auth_id_var.get().strip()
+        auth_token = self.pro_auth_token_var.get().strip()
+        pro_license = self.pro_license_var.get().strip() or DEFAULT_LICENSE_VALUE
+        identity = {
+            "proxy_url": None,
+            "auth_mode": "secret",
+            "auth_id": auth_id,
+            "auth_token": auth_token,
+            "api_key": auth_id,  # chỉ dùng để hiển thị log (_mask_key) - không dùng để gọi API
+            "license": pro_license,
+            "headers": {
+                "User-Agent": STABLE_USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        }
+
+        total_attempts = max(max_retries, PRO_MAX_RETRIES)
+        attempt = 0
+        while not self.stop_requested and attempt < total_attempts:
+            attempt += 1
+            outcome = self.call_smarty_api(street_input, identity)
+
+            if not outcome.get("rate_limited") and not outcome.get("network_error"):
+                self._mark_key_success(auth_id)
+                outcome["_proxy_url"] = None
+                return outcome
+
+            if outcome.get("rate_limited"):
+                retry_after = outcome.get("retry_after", "")
+                try:
+                    server_wait = int(retry_after)
+                except (TypeError, ValueError):
+                    server_wait = 0
+                wait_seconds = max(server_wait, PRO_RATE_LIMIT_WAIT_SECONDS)
+                self.log(
+                    f"  [!] Dòng {row_num}: Smarty trả về 429 dù đang dùng Secret Key Pro (lần {attempt}/{total_attempts}). "
+                    f"Chờ {wait_seconds}s rồi thử lại với CHÍNH cặp key này (không có key khác để đổi)."
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            self.log(
+                f"  [!] Dòng {row_num}: Lỗi mạng/Timeout khi dùng Secret Key Pro (lần {attempt}/{total_attempts}). "
+                "Thử lại (không có proxy khác để chuyển)..."
+            )
+            time.sleep(min(3 * attempt, 15))
+
+        if self.stop_requested:
+            return {"result": "Bị dừng", "analysis": {}, "stopped": True}
+        return {
+            "result": "Bị dừng: đã thử lại nhiều lần với Key Pro nhưng Smarty vẫn không phản hồi thành công",
+            "analysis": {},
+            "stopped": True,
+            "rate_limit_exhausted": True,
+        }
 
     # ---- Bảng mã tra cứu chính thức của Smarty (US Street API) ----
     DPV_FOOTNOTE_INFO = {
@@ -2149,11 +2272,16 @@ Danh sách đầu vào (JSON):
         self.worker_menu.config(state=tk.NORMAL)
         self.btn_clear_cache.config(state=tk.NORMAL)
         self.entry_delay.config(state=tk.NORMAL)
+        self.entry_pro_auth_id.config(state=tk.NORMAL)
+        self.entry_pro_auth_token.config(state=tk.NORMAL)
+        self.entry_pro_license.config(state=tk.NORMAL)
+        self.entry_pro_delay.config(state=tk.NORMAL)
+        self.pro_worker_menu.config(state=tk.NORMAL)
+        for i in range(len(self.connection_notebook.tabs())):
+            self.connection_notebook.tab(i, state="normal")
         self.rb_match_strict.config(state=tk.NORMAL)
         self.rb_match_enhanced.config(state=tk.NORMAL)
         self.chk_use_ai.config(state=tk.NORMAL)
-        if self.use_ai_var.get():
-            self._set_ai_inputs_state(tk.NORMAL)
 
 if __name__ == "__main__":
     root = tk.Tk()
