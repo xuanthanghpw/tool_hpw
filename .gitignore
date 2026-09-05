@@ -1,6 +1,14 @@
-dist/
-buid/
+# Python
 __pycache__/
+*.pyc
+
+# PyInstaller
+build/
+dist/
 *.spec
-*.ini
-*.rar
+
+# EXE
+*.exe
+
+# Release
+check_address/SmartyTool_Release/
